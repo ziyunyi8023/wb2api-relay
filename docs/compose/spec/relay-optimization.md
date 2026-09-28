@@ -1,14 +1,26 @@
 ---
 feature: relay-optimization
-status: in-progress
+status: delivered
 updated: 2026-09-28
 branch: feat/relay-optimization
-commits:
+commits: 1e23c2b..8f7f413
 ---
 
 # 中转站全方面优化（实用性 / 稳定性 / 响应速度）
 
+
 ## Report
+
+**What was built** — 中转站全方面优化（除账号自动摘除）交付完毕。T0 把实现基线从旧快照切到上游 v1.11.9 并重编译升级生产 wb2api.exe（白拿池最早到期优先路由、SSE 修复、面板增强）。T1–T2 为看门狗加 QUIC 减振（--edge-ip-version 4）与重启前日志归档（logs\archive，保留 30 份）。T3 每日备份 auths+config（幂等、SHA256 manifest、03:00 计划任务）。T4 header_timeout 120→60 提速失败切换。T5 stats-gen 生成指标页（成功率/延迟/TTFB/账号 Top/模型分布）。T6–T7 为 Go 服务加 POST /debug/drain（与 SIGTERM 同路径、20s 停机窗）并接入看门狗重启流程（drain→等优雅退出→再启动）。T8 compose 补 healthcheck/日志轮转/端口 8788 对齐 + 云热备部署文档。
+
+**Verification** — go build ./... exit=0；go test ./internal/server ./cmd/server ok（8.138s/0.079s）；e2e POST /debug/drain → 202 {"status":"draining"}→进程优雅退出（log: drain requested→bye）；T7 集成日志链 drain 应答 202→drain 完成，进程已优雅退出→wb2api 已启动 pid=7324；backup.ps1 双跑幂等（12 auths+manifest）+ 计划任务 Ready；stats.html q=7864 succ=94.35%；config header_timeout=60 后 panel/models 200；watchdog -Once 体检 exit=0。评审两轮：首轮 CRITICAL（T8 端口 7863 残留+compose 乱码）已修复（8f7f413），复审 PASS。
+
+**Journey log**
+- 旧快照≠新源码：wb2api-deploy 单提交旧快照，上游 linguo2625469/workbuddy2api-panel 才是真源；升级先于自研改动收益最大。
+- Windows PS5.1 Get-Content -Raw 按 GBK 读 UTF-8 会吞换行：spec/compose 曾损坏，改用 [IO.File]::ReadAllText(..., UTF8) 或 Write 工具。
+- exe 体积同值无法判版本：用 SHA256 + 二进制内 '/debug/drain' 标记；旧 exe 无端点时期 drain 404 是预期回退。
+- 进程匹配自杀：CommandLine 匹配串含脚本名会命中工具壳自身，须锚定 -File 行尾并排除 $PID。
+- Windows 下无法向隐藏进程发信号：HTTP /debug/drain 是看门狗触发优雅停机的等价入口。
 
 ## [S1] Problem
 
