@@ -27,6 +27,13 @@ type Config struct {
 		PackageDetailLimit int `json:"package_detail_limit"`
 	} `json:"panel"`
 
+	// Storage 落盘形态。
+	Storage struct {
+		// Encrypt auths/*.json 落盘加密（AES-GCM，密钥 crypto.secret 自动管理）。缺省 true；
+		// 显式 false 关闭（写回明文，供外部脚本直接读）。
+		Encrypt bool `json:"encrypt"`
+	} `json:"storage"`
+
 	Cooldown struct {
 		// hard_credit / err_threshold / err_cooldown 三个历史键已退役：
 		// 硬冷却固定为次日 04:00（CooldownUntilTomorrow4AM），连续错误语义并入熔断器。
@@ -215,6 +222,7 @@ func Default() *Config {
 	c.Features.SanitizeBlacklistFingerprints = true
 	c.Prompt.Mode = "passthrough" // 缺省 passthrough：透传客户端原始 system（对齐上游；custom 由用户显式选择）
 	c.Pool.MaxInFlight = 3
+	c.Storage.Encrypt = true
 	// MaxInFlightGlobal 缺省 2：global 域 WAF 风控更紧，压低单号并发（WAF 403 修复
 	// P1-1）；0/负数 normalize 回落默认（与 max_in_flight 的 0=不限语义不同，分档键
 	// 的 0 没有合理语义，回退分档默认最稳）。

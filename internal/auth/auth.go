@@ -215,6 +215,11 @@ func Parse(raw []byte) (*Auth, error) {
 	if len(raw) == 0 {
 		return nil, fmt.Errorf("empty auth storage")
 	}
+	// 密文形态先解密（无魔数时 OpenStorage 透传，明文存量零影响）。
+	raw, err := OpenStorage(raw)
+	if err != nil {
+		return nil, err
+	}
 	var probe map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &probe); err != nil {
 		return nil, fmt.Errorf("storage_parse_error: %w", err)
@@ -319,6 +324,8 @@ func (a *Auth) SaveAtomic() error {
 	if err != nil {
 		return err
 	}
+	// 密钥就绪时落盘加密（WBAPIENC1 + GCM）；无密钥透传保持旧形态。
+	raw = SealStorage(raw)
 	tmp := a.FilePath + ".tmp"
 	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
 		// Docker bind-mount 权限问题的典型现场：容器内 app 用户（uid 10001）

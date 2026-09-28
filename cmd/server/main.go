@@ -71,6 +71,20 @@ func main() {
 		}
 	}
 
+	// auths 落盘加密（storage.encrypt 缺省 true）：密钥 crypto.secret 与 config 同目录，
+	// 缺失自动生成；必须先于 LoadDir——存量明文文件照常读入，SaveAtomic 写回时落密文。
+	if cfg.Storage.Encrypt {
+		keyPath := filepath.Join(filepath.Dir(*cfgPath), "crypto.secret")
+		key, kerr := auth.LoadOrCreateKeyFile(keyPath)
+		if kerr != nil {
+			log.Fatalf("crypto secret: %v", kerr)
+		}
+		if err := auth.SetEncryptionKey(key); err != nil {
+			log.Fatalf("crypto key: %v", err)
+		}
+		log.Printf("auths 落盘加密已启用（%s）", keyPath)
+	}
+
 	auths, err := auth.LoadDir(cfg.AuthDir)
 	if err != nil {
 		log.Fatalf("load auths: %v", err)
