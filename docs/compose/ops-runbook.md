@@ -41,5 +41,6 @@
 ## 安全说明
 
 - `auths\` 与 `config.json` ACL 仅 Administrator+SYSTEM（收紧自 2026-09-28）
+- **auths 落盘加密**（AES-256-GCM）：密钥在 `workbuddy2api-panel\crypto.secret`（自动生成，勿删勿泄）；读写透明——明文存量照常加载，首次 SaveAtomic 后转密文。外部脚本直接读 auths 会看到密文；需明文时在 config 设 `storage.encrypt: false` 重启
 - `exe.sha256` 钉扎防二进制替换；换 exe 必须 `-UpdateHash`
 - API Key 当前 `test_key`（方便优先）；公网仅应暴露 `/v1`，面板路径自行知悉
