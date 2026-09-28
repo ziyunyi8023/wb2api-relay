@@ -62,6 +62,11 @@ type Config struct {
 	// 在 recordAttempt 这一唯一汇聚点调用，因此流式/非流式、成功/失败都会计入，
 	// 且与 pool 的每账号累计器同源，两条口径不会漂移。
 	Usage *usage.Recorder
+
+	// Drain 触发优雅停机的回调（可选；nil = /debug/drain 返回 501）。
+	// 与 SIGTERM 同路径（落盘 + srv.Shutdown 等在飞或超时后退出）；Windows 下
+	// 看门狗无法向隐藏进程发信号，HTTP 触发是运维侧的等价入口。
+	Drain func()
 }
 
 // loadLive 返回当前运行期快照；Live 为 nil 时用静态字段合成。
@@ -126,6 +131,7 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
 	h.mux.HandleFunc("GET /healthz", h.healthz)
+	h.mux.HandleFunc("POST /debug/drain", h.withAuth(h.drain))
 	if cfg.Panel != nil {
 		h.mux.Handle("/panel/", cfg.Panel) // /panel → /panel/ 由 ServeMux 自动重定向
 	}
@@ -134,6 +140,20 @@ func NewHandler(cfg Config) *Handler {
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.mux.ServeHTTP(w, r)
+}
+
+// drain POST /debug/drain：触发优雅停机。先应答 202 再异步走 SIGTERM 同路径，
+// 确保响应送达后才进入 Shutdown（在飞请求保留至 drain 窗口结束）。
+func (h *Handler) drain(w http.ResponseWriter, r *http.Request) {
+	if h.cfg.Drain == nil {
+		http.Error(w, `{"error":"drain not wired"}`, http.StatusNotImplemented)
+		return
+	}
+	log.Printf("[drain] requested")
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusAccepted)
+	_, _ = w.Write([]byte(`{"status":"draining"}`))
+	go h.cfg.Drain()
 }
 
 func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {
