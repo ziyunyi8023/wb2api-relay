@@ -44,3 +44,8 @@ docs/
 /cmd/desktopverify*/
 *.zip
 server.exe
+
+# local build outputs (relay-optimization)
+/wb2api-new.exe
+/wb2api-drain.exe
+
