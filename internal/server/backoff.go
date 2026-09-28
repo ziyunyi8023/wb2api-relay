@@ -7,7 +7,21 @@ import (
 	"context"
 	"math/rand/v2"
 	"time"
+
+	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
+
+// rotateNeedsBackoff 判定「换号前是否要退避」。账号停车场类错误（软/硬冷却、
+// 模型级 6004 限额）的保护伞是冷却本身——该账号已移出候选，下一个号是全新
+// 状态，再睡 500ms+ 只会把延迟转嫁给用户首字。WAF/网络/共享出口类错误保留
+// 指数退避（防同一出口 IP 请求放大，WAF 403 修复 P0-2 的本意）。
+func rotateNeedsBackoff(kind upstream.ErrKind) bool {
+	switch kind {
+	case upstream.ErrSoftRate, upstream.ErrHardCredit, upstream.ErrModelBlocked:
+		return false
+	}
+	return true
+}
 
 // rotateBackoffBase 轮转退避基数（对齐官方 intl CLI computeRequestRetryDelayMs
 // 的 500ms 形态，WAF 403 并发研究报告 §2.1/§6 P0-2）。测试可置 0 跳过等待

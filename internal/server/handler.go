@@ -829,6 +829,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			if kind == upstream.ErrWafBlock && h.wafIP.noteWaf(acct.UID) {
 				break
 			}
+			// 账号停车场（软限/硬限/模型级）→ 零等待换新号；其余（WAF/网络/5xx）
+			// 保留指数退避防出口放大。
+			if !rotateNeedsBackoff(kind) {
+				continue
+			}
 			if !rotateBackoff(i, r.Context()) {
 				break // ctx 取消：终止轮转（分类错误换号退避）
 			}
