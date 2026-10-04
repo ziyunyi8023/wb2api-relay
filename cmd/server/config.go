@@ -59,6 +59,13 @@ type Config struct {
 		// SoftRateMax 软冷却指数退避的封顶，默认 "2h"。
 		// 空值回落默认，非法值报错（处理风格同 soft_rate）。
 		SoftRateMax string `json:"soft_rate_max"` // "2h"
+		// ModelRateLimitMax 6004 模型级限流冷却的墙钟封顶，默认 "12h"。
+		//
+		// 与 SoftRateMax 分开的原因：soft_rate_max 封的是**账号级**指数退避（防反复
+		// 429 把号无限期葬送）；6004 有上游权威 resetAt 墙钟且只锁 (账号,模型) 对，
+		// 按 2h 截断会造出「本地已解封、上游仍在限流」的错位窗口，白吞可用时段。
+		// 空值回落默认，非法值报错。
+		ModelRateLimitMax string `json:"model_rate_limit_max"` // "12h"
 	} `json:"cooldown"`
 
 	Schedule struct {
@@ -195,6 +202,7 @@ type Config struct {
 	// 解析后
 	SoftRateDur            time.Duration `json:"-"`
 	SoftRateMaxDur         time.Duration `json:"-"`
+	ModelRateLimitMaxDur   time.Duration `json:"-"`
 	BreakerCooldownDur     time.Duration `json:"-"`
 	BreakerCooldownMaxD    time.Duration `json:"-"`
 	DegradeCooldownDur     time.Duration `json:"-"`
@@ -217,6 +225,7 @@ func Default() *Config {
 	}
 	c.Cooldown.SoftRate = "600s"
 	c.Cooldown.SoftRateMax = "2h"
+	c.Cooldown.ModelRateLimitMax = "12h"
 	c.Panel.PackageDetailLimit = 5
 	c.Logging.RequestArchiveEnabled = true
 	c.Logging.RequestRetentionDays = 7
@@ -369,6 +378,9 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("WB2A_SOFT_RATE_MAX"); v != "" {
 		c.Cooldown.SoftRateMax = v
 	}
+	if v := os.Getenv("WB2A_MODEL_RATE_LIMIT_MAX"); v != "" {
+		c.Cooldown.ModelRateLimitMax = v
+	}
 	if v := os.Getenv("WB2A_TIMEOUT_SECONDS"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			c.Upstream.TimeoutSeconds = n
@@ -448,6 +460,13 @@ func (c *Config) normalize() error {
 	}
 	if c.SoftRateMaxDur, err = time.ParseDuration(c.Cooldown.SoftRateMax); err != nil {
 		return fmt.Errorf("cooldown.soft_rate_max: %w", err)
+	}
+	// 空值回落默认 12h（Default() 已置值；此兜底覆盖显式 "" 与 Default() 被绕过的场景）。
+	if c.Cooldown.ModelRateLimitMax == "" {
+		c.Cooldown.ModelRateLimitMax = "12h"
+	}
+	if c.ModelRateLimitMaxDur, err = time.ParseDuration(c.Cooldown.ModelRateLimitMax); err != nil {
+		return fmt.Errorf("cooldown.model_rate_limit_max: %w", err)
 	}
 	if c.BreakerCooldownDur, err = time.ParseDuration(c.Pool.BreakerCooldown); err != nil {
 		return fmt.Errorf("pool.breaker_cooldown: %w", err)

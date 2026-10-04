@@ -25,6 +25,9 @@ type Pool struct {
 	breakerCooldownMax time.Duration
 	// softRateMax 软冷却指数退避的封顶（SetSoftRateMax 注入；默认 defaultSoftRateMax）。
 	softRateMax time.Duration
+	// modelRateLimitMax 6004 模型级冷却的墙钟封顶（SetModelRateLimitMax 注入；
+	// 默认 defaultModelRateLimitMax）。与 softRateMax 分开的原因见该 setter。
+	modelRateLimitMax time.Duration
 	// costExploreInterval costTier 条件探索窗口（issue #136 方案 a′，SetCostExploreInterval
 	// 注入；默认 defaultCostExploreInterval 30m）。tier 0 垄断 + tier 1 存在且距上次
 	// 探索 ≥ 窗口时，本次 pick 生效层切 tier 1-only（探索=搭车改道，零新增上游请求）。
@@ -143,6 +146,21 @@ func (p *Pool) SetSoftRateMax(d time.Duration) {
 	defer p.mu.Unlock()
 	if d > 0 {
 		p.softRateMax = d
+	}
+}
+
+// SetModelRateLimitMax 注入 6004 模型级冷却的墙钟封顶（main 从 config 解析后调用）。
+// 非正值保留默认值（12h），风格同 SetSoftRateMax。
+//
+// 为什么独立于 softRateMax：soft_rate_max 是**账号级**指数退避的封顶，作用是防止
+// 反复 429 把号无限期葬送；6004 不是这种情况——它有上游权威 resetAt 墙钟，且只锁
+// (账号,模型) 对，号对其他模型照常可用。拿 2h 封顶去截上游墙钟会造出「本地已解封、
+// 上游仍在限流」的错位窗口，白吞可用时段。
+func (p *Pool) SetModelRateLimitMax(d time.Duration) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if d > 0 {
+		p.modelRateLimitMax = d
 	}
 }
 

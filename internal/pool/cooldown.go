@@ -138,7 +138,7 @@ func (p *Pool) Cooldown(uid string, kind CoolKind, d time.Duration, reason strin
 // 精确对齐到上游重置墙钟（不做指数堆加、不做 softStreak 计数）。
 //
 //   - resetAt 非零（带解析时间）→ modelCooldowns[model].Until = min(resetAt,
-//     now+softRateMax)，ResetAt 记录上游原始墙钟（台账 ResetAt）。不写 until
+//     now+modelRateLimitMax)，ResetAt 记录上游原始墙钟（台账 ResetAt）。不写 until
 //     （全账号级冷却不受模型级限流污染），切模型即可用（模型豁免）。
 //   - resetAt 零值（无时间文案）→ 有界退避：base 起按 softStreak 翻倍、封顶
 //     softRateMax，且**在软冷却中**（until 未到期）时不推进/不延长（兜底探测不再把
@@ -146,18 +146,24 @@ func (p *Pool) Cooldown(uid string, kind CoolKind, d time.Duration, reason strin
 //
 // 与旧实现的差异：有上游重置时间时绝对不做指数堆加；无重置时间时，「冷却中兜底
 // 探测再 429」不再 softStreak++ 翻倍——这正是用户「全池被推到 2h 封顶」的元凶。
+//
+// 模型级封顶用 modelRateLimitMax 而非 softRateMax：6004 的 resetAt 是上游权威恢复
+// 墙钟，实测可比 softRateMax（2h）晚数小时（global 域 deepseek 6004 的 resetAt 在
+// 15:00–21:00 之间）。按 softRateMax 截断会让 until 比 resetAt 早 3–9 小时，号白挂
+// 冷却、可调用窗口被凭空吞掉；模型级只影响该 (账号,模型) 对且有上游墙钟兜底，
+// 不存在「指数堆加把号葬送」的风险，故用独立且更宽的封顶。
 func (p *Pool) CooldownSoftForModel(uid string, base time.Duration, resetAt time.Time, model, reason string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if e, ok := p.byUID[uid]; ok {
 		now := time.Now()
 		if !resetAt.IsZero() {
-			// 有上游重置时间：冷却截止 = min(resetAt, now+softRateMax)，不做指数放大。
+			// 有上游重置时间：冷却截止 = min(resetAt, now+modelRateLimitMax)，不做指数放大。
 			if e.modelCooldowns == nil {
 				e.modelCooldowns = map[string]modelCooldown{}
 			}
 			e.modelCooldowns[model] = modelCooldown{
-				Until:   p.cappedSoftUntilLocked(now, resetAt),
+				Until:   p.cappedModelRateLimitUntilLocked(now, resetAt),
 				ResetAt: resetAt,
 				Reason:  reason,
 			}
@@ -343,6 +349,32 @@ func (p *Pool) cappedSoftUntilLocked(now, resetAt time.Time) time.Time {
 		return resetAt
 	}
 	return now.Add(time.Millisecond)
+}
+
+// cappedModelRateLimitUntilLocked 6004 模型级冷却的墙钟截断：与
+// cappedSoftUntilLocked 同形，但封顶用 modelRateLimitMax（独立、更宽）。
+// 6004 的 resetAt 是上游权威恢复时刻，按 softRateMax 截断会制造「本地已解封、
+// 上游仍在限流」的错位窗口——号白白占着避让而不可用。模型级只锁 (账号,模型) 对，
+// 且有上游墙钟兜底，不需要账号级那种「防指数堆加」的保守封顶。
+// 调用方必须已持有 p.mu。
+func (p *Pool) cappedModelRateLimitUntilLocked(now, resetAt time.Time) time.Time {
+	cap := now.Add(p.modelRateLimitMaxOr())
+	if resetAt.After(cap) {
+		return cap
+	}
+	if resetAt.After(now) {
+		return resetAt
+	}
+	return now.Add(time.Millisecond)
+}
+
+// modelRateLimitMaxOr 返回模型级 6004 的生效封顶：SetModelRateLimitMax 注入优先，
+// 否则回落 defaultModelRateLimitMax。调用方必须已持有 p.mu。
+func (p *Pool) modelRateLimitMaxOr() time.Duration {
+	if p.modelRateLimitMax > 0 {
+		return p.modelRateLimitMax
+	}
+	return defaultModelRateLimitMax
 }
 
 // softRateMaxOr 返回生效的 softRateMax（未注入时按默认 2h），供封顶计算。

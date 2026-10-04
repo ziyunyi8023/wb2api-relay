@@ -871,11 +871,14 @@ func TestCooldownSoftForModelParsedUntil(t *testing.T) {
 }
 
 func TestCooldownSoftForModelCappedBySoftRateMax(t *testing.T) {
-	// 解析时间超出 soft_rate_max → 截断到 soft_rate_max（不无限期拉黑）。
+	// 解析时间超出**模型级**封顶 → 截断到 model_rate_limit_max（不无限期拉黑）。
+	// 注意封顶源已从 soft_rate_max 拆出：6004 有上游权威 resetAt，按账号级 2h
+	// 封顶会造出「本地已解封、上游仍在限流」的错位窗口。
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
-	p.SetSoftRateMax(10 * time.Minute)
-	reset := time.Now().Add(2 * time.Hour) // 远超过封顶 10m
+	p.SetSoftRateMax(10 * time.Minute)       // 账号级封顶：不参与 6004
+	p.SetModelRateLimitMax(10 * time.Minute) // 模型级封顶
+	reset := time.Now().Add(2 * time.Hour)   // 远超过封顶 10m
 	before := time.Now()
 	p.CooldownSoftForModel("u1", 600*time.Second, reset, "glm-5.3", "429 rate limit")
 	st, _ := p.Status("u1")
@@ -883,7 +886,7 @@ func TestCooldownSoftForModelCappedBySoftRateMax(t *testing.T) {
 		t.Fatalf("want model ledger row: %+v", st.RateLimitedModels)
 	}
 	if st.RateLimitedModels[0].Until.Sub(before) > 10*time.Minute+time.Second {
-		t.Errorf("model until=%v want capped at soft_rate_max=10m", st.RateLimitedModels[0].Until)
+		t.Errorf("model until=%v want capped at model_rate_limit_max=10m", st.RateLimitedModels[0].Until)
 	}
 }
 

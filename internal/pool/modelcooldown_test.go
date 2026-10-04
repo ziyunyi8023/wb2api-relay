@@ -92,11 +92,13 @@ func TestCooldownSoftForModelDoesNotClobberUntil(t *testing.T) {
 }
 
 // TestCooldownSoftForModelCapsUntilKeepsResetAt 6004 写 modelCooldowns：
-// until 截断到 soft_rate_max，reset_at 保留上游原始墙钟（issue #36 台账语义迁移）。
+// until 按**模型级**封顶（modelRateLimitMax）截断，reset_at 保留上游原始墙钟
+// （issue #36 台账语义迁移）。
 func TestCooldownSoftForModelCapsUntilKeepsResetAt(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
-	p.SetSoftRateMax(10 * time.Minute)
+	p.SetSoftRateMax(10 * time.Minute) // 账号级封顶：6004 不受它约束
+	p.SetModelRateLimitMax(10 * time.Minute)
 	reset := time.Now().Add(2 * time.Hour) // 远超封顶 → until 截断到 10m，reset_at 保留 2h
 	p.CooldownSoftForModel("u1", 600*time.Second, reset, "glm-5.3", "6004 model rate limit")
 	p.mu.RLock()
@@ -110,6 +112,52 @@ func TestCooldownSoftForModelCapsUntilKeepsResetAt(t *testing.T) {
 	}
 	if d := mc.ResetAt.Sub(reset); d < -time.Second || d > time.Second {
 		t.Errorf("ResetAt=%v want ~2h 后=%v", mc.ResetAt, reset)
+	}
+}
+
+// TestCooldownSoftForModelIgnoresSoftRateMax 回归：6004 的 until **不得**被
+// soft_rate_max（账号级指数退避封顶）截断。实测 global 域 deepseek 的 6004
+// resetAt 在 15:00–21:00（距触发 10h+），按 2h 封顶会让 until 远早于上游墙钟——
+// 号白挂避让而不可用。模型级封顶独立配置（默认 12h），soft_rate_max 不参与。
+func TestCooldownSoftForModelIgnoresSoftRateMax(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.SetSoftRateMax(2 * time.Hour) // 账号级封顶刻意设小
+	reset := time.Now().Add(8 * time.Hour)
+	p.CooldownSoftForModel("u1", 600*time.Second, reset, "deepseek-v4.1-flash", "6004 model rate limit")
+	p.mu.RLock()
+	mc := p.byUID["u1"].modelCooldowns["deepseek-v4.1-flash"]
+	p.mu.RUnlock()
+	// until 应贴近上游墙钟（默认 12h 模型级封顶下不被 2h 截断）
+	if d := mc.Until.Sub(reset); d < -time.Second || d > time.Second {
+		t.Errorf("Until=%v 应对齐上游 resetAt=%v（不受 soft_rate_max 截断），偏差 %v", mc.Until, reset, d)
+	}
+}
+
+// TestCooldownSoftForModelDefaultCapBeyondSoftRateMax 未显式注入时，模型级封顶
+// 回落 defaultModelRateLimitMax（12h），仍是有限值。
+func TestCooldownSoftForModelDefaultCapBeyondSoftRateMax(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	reset := time.Now().Add(8 * time.Hour)
+	p.CooldownSoftForModel("u1", 600*time.Second, reset, "m", "6004 model rate limit")
+	p.mu.RLock()
+	mc := p.byUID["u1"].modelCooldowns["m"]
+	p.mu.RUnlock()
+	if d := mc.Until.Sub(reset); d < -time.Second || d > time.Second {
+		t.Errorf("未注入模型级封顶时 until 应等于 resetAt，实际偏差 %v", d)
+	}
+	// 超长墙钟仍被封顶（防御畸形远期值）：100h 后应截到 12h。
+	far := time.Now().Add(100 * time.Hour)
+	p.CooldownSoftForModel("u1", 600*time.Second, far, "m2", "6004 model rate limit")
+	p.mu.RLock()
+	mc2 := p.byUID["u1"].modelCooldowns["m2"]
+	p.mu.RUnlock()
+	if rem := mc2.Until.Sub(time.Now()); rem <= 0 || rem > defaultModelRateLimitMax+time.Second {
+		t.Errorf("远期墙钟应被封顶到 %v，实际剩余 %v", defaultModelRateLimitMax, rem)
+	}
+	if d := mc2.ResetAt.Sub(far); d < -time.Second || d > time.Second {
+		t.Errorf("封顶不影响 ResetAt 台账：ResetAt=%v want %v", mc2.ResetAt, far)
 	}
 }
 
