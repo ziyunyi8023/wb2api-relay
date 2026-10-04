@@ -817,6 +817,21 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				st.status = http.StatusBadRequest
 				return
 			}
+			// 11151「a message has empty content」：确定性请求级错误，立即透传原文，
+			// 不罚号不轮转。同一 body 换任何账号都是 400；若继续轮号，末端会把真实
+			// 原因伪装成 503 no_healthy_account（账号耗尽假象）。
+			if kind == upstream.ErrEmptyContent {
+				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
+				fail(acct.UID)
+				msg := string(respBody)
+				if strings.TrimSpace(msg) == "" {
+					msg = "a message has empty content, please check the conversation history and retry"
+				}
+				writeOpenAIErrorHint(w, http.StatusBadRequest, "empty_content", msg,
+					h.hintOf(upstream.ErrEmptyContent, string(respBody), bareModel, reqHasImage, uerr))
+				st.status = http.StatusBadRequest
+				return
+			}
 			// lastErr 携带完整 body（uerr.Msg 在 upstream 侧截断 200 字符，透传语义
 			// 要求原文全量）+ Kind/RetryAfter（末端映射与冷却时长共用）。
 			lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody), RetryAfter: uerr.RetryAfter}
@@ -1007,6 +1022,8 @@ func rotateBackoff(i int, ctx context.Context) bool {
 //   - ErrImageInvalid → 图片格式/数据无效：请求的问题不是账号的问题（同一 body
 //     换任何号都会得到相同的解析错误）。零动作（不冷却/不熔断/不 NoteError、
 //     不喂连败），chatCompletions 已直接透传原文返回不轮转。
+//   - ErrEmptyContent → 11151 空 content 消息：请求的问题不是账号的问题。零动作，
+//     chatCompletions 已 fail-fast 透传原文返回不轮转。
 //   - ErrModelBlocked → BlockModelBackoff：(账号, 模型) 11102 负缓存避让。
 //   - ErrServer → NoteError：喂单一连续失败计数器 fails + 累计错误 errTotal，
 //     达到 breakerThreshold 触发熔断（指数退避）。
@@ -1085,6 +1102,8 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 	case upstream.ErrImageInvalid:
 		// 图片格式/数据无效：请求的问题不是账号的问题（同一 body 换任何号都会
 		// 得到相同解析错误）。零动作，chatCompletions 已 fail-fast 透传。
+	case upstream.ErrEmptyContent:
+		// 11151 空 content 消息：请求的问题不是账号的问题。零动作，fail-fast 透传。
 	case upstream.ErrBadParams:
 		// 请求体解析失败（400 + Unmarshal chat params failed / 11101）：发给上游的 body
 		// 有问题（网关侧不再截断，均为客户端畸形 JSON）。换了账号照样 400，

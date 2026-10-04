@@ -40,6 +40,7 @@ const (
 	ErrWafBlock                      // 403 + 非业务信封体（APISIX WAF 拦截页/空体）→ 账号软冷却 + 抖动退避
 	ErrPromptTooLong                 // 11115「prompt is too long」→ 请求级错误（上下文超限是请求的问题非账号的问题）：不罚号、不轮转，末端透传原文
 	ErrImageInvalid                  // 图片请求格式/数据无效 → 请求级错误：不罚号、不轮转，末端透传原文
+	ErrEmptyContent                  // 11151「a message has empty content」→ 请求级错误：不罚号、不轮转，末端透传原文
 	ErrClient                        // 其他 4xx / 业务错误
 )
 
@@ -67,6 +68,8 @@ func (k ErrKind) String() string {
 		return "prompt_too_long"
 	case ErrImageInvalid:
 		return "image_invalid"
+	case ErrEmptyContent:
+		return "empty_content"
 	case ErrAccountFault:
 		return "account_fault"
 	case ErrClient:
@@ -169,6 +172,15 @@ var invalidImageMarkers = []string{
 	"invalid image_url content",
 	"invalid_image_data",
 	"replace the image",
+}
+
+// emptyContentMarkers 上游 11151「a message has empty content」文案（HTTP 400）。
+// 确定性请求级错误：conversation history 里有空 content 消息，同一 body 换任何
+// 账号都会被拒——必须 fail-fast，轮转只会把健康号配额烧光后伪装成 no_healthy_account。
+// 业务码 11151 / extError 400001 走 codeMarker（JSON 空白容差），文案走本词表。
+var emptyContentMarkers = []string{
+	"a message has empty content",
+	"message has empty content",
 }
 
 // 定位：上下文超限是**请求的问题不是账号的问题**——同一个 body 换任何账号发都会
@@ -561,6 +573,19 @@ func Classify(status int, body string) ErrKind {
 		for _, m := range invalidImageMarkers {
 			if strings.Contains(lower, m) {
 				return ErrImageInvalid
+			}
+		}
+	}
+	// 11151「a message has empty content」：确定性请求级错误（对话历史含空 content）。
+	// 同 body 换账号照样 400——必须 fail-fast，否则轮完号后 503 no_healthy_account
+	// 会把真实原因（请求体问题）伪装成账号耗尽。
+	if status == http.StatusBadRequest {
+		if codeMarker(lower, "11151") || codeMarker(lower, "400001") {
+			return ErrEmptyContent
+		}
+		for _, m := range emptyContentMarkers {
+			if strings.Contains(lower, m) {
+				return ErrEmptyContent
 			}
 		}
 	}

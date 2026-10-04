@@ -288,3 +288,158 @@ func TestNormalizeImageURL(t *testing.T) {
 		})
 	}
 }
+
+// TestNormalizeEmptyContent 出站前消除空 content 消息，防上游 400 11151。
+// 走 PrepareBodyOptWithEfforts 全链路（含 tool 配对后的 normalizeEmptyContent）。
+func TestNormalizeEmptyContent(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want []struct {
+			role       string
+			hasContent bool
+			content    string // hasContent 且 content 为 string 时断言
+			hasCalls   bool
+		}
+	}{
+		{
+			name: "user 空串整条删除",
+			body: `{"messages":[{"role":"user","content":"hi"},{"role":"user","content":""},{"role":"user","content":"ok"}]}`,
+			want: []struct {
+				role       string
+				hasContent bool
+				content    string
+				hasCalls   bool
+			}{
+				{role: "user", hasContent: true, content: "hi"},
+				{role: "user", hasContent: true, content: "ok"},
+			},
+		},
+		{
+			name: "user null content 删除",
+			body: `{"messages":[{"role":"user","content":null},{"role":"user","content":"x"}]}`,
+			want: []struct {
+				role       string
+				hasContent bool
+				content    string
+				hasCalls   bool
+			}{
+				{role: "user", hasContent: true, content: "x"},
+			},
+		},
+		{
+			name: "assistant 空串 + tool_calls：删 content 保留调用",
+			body: `{"messages":[{"role":"assistant","content":"","tool_calls":[{"id":"c1","type":"function","function":{"name":"f","arguments":"{}"}}]},{"role":"tool","tool_call_id":"c1","content":"result"}]}`,
+			want: []struct {
+				role       string
+				hasContent bool
+				content    string
+				hasCalls   bool
+			}{
+				{role: "assistant", hasContent: false, hasCalls: true},
+				{role: "tool", hasContent: true, content: "result"},
+			},
+		},
+		{
+			name: "tool 空 content 改写占位保配对",
+			body: `{"messages":[{"role":"assistant","content":"a","tool_calls":[{"id":"c1","type":"function","function":{"name":"f","arguments":"{}"}}]},{"role":"tool","tool_call_id":"c1","content":""}]}`,
+			want: []struct {
+				role       string
+				hasContent bool
+				content    string
+				hasCalls   bool
+			}{
+				{role: "assistant", hasContent: true, content: "a", hasCalls: true},
+				{role: "tool", hasContent: true, content: "."},
+			},
+		},
+		{
+			name: "assistant 无调用空串删除",
+			body: `{"messages":[{"role":"assistant","content":""},{"role":"user","content":"q"}]}`,
+			want: []struct {
+				role       string
+				hasContent bool
+				content    string
+				hasCalls   bool
+			}{
+				{role: "user", hasContent: true, content: "q"},
+			},
+		},
+		{
+			name: "空数组 content 删除；图片 part 保留",
+			body: `{"messages":[{"role":"user","content":[]},{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:x"}}]}]}`,
+			want: []struct {
+				role       string
+				hasContent bool
+				content    string
+				hasCalls   bool
+			}{
+				{role: "user", hasContent: true},
+			},
+		},
+		{
+			name: "非空消息原样保留",
+			body: `{"messages":[{"role":"system","content":"s"},{"role":"user","content":"u"}]}`,
+			want: []struct {
+				role       string
+				hasContent bool
+				content    string
+				hasCalls   bool
+			}{
+				{role: "system", hasContent: true, content: "s"},
+				{role: "user", hasContent: true, content: "u"},
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out := PrepareBodyOptWithEfforts([]byte(tc.body), false, nil)
+			var obj map[string]any
+			if err := json.Unmarshal(out, &obj); err != nil {
+				t.Fatalf("unmarshal: %v (out=%s)", err, out)
+			}
+			msgs, _ := obj["messages"].([]any)
+			if len(msgs) != len(tc.want) {
+				t.Fatalf("messages len=%d want %d (out=%s)", len(msgs), len(tc.want), out)
+			}
+			for i, w := range tc.want {
+				msg, ok := msgs[i].(map[string]any)
+				if !ok {
+					t.Fatalf("msg[%d] not object", i)
+				}
+				if role, _ := msg["role"].(string); role != w.role {
+					t.Errorf("msg[%d].role=%q want %q", i, role, w.role)
+				}
+				c, hasContent := msg["content"]
+				if hasContent != w.hasContent {
+					t.Fatalf("msg[%d].hasContent=%v want %v (content=%#v)", i, hasContent, w.hasContent, c)
+				}
+				if w.hasContent && w.content != "" {
+					if s, _ := c.(string); s != w.content {
+						t.Errorf("msg[%d].content=%q want %q", i, s, w.content)
+					}
+				}
+				_, hasCalls := msg["tool_calls"]
+				if hasCalls != w.hasCalls {
+					t.Errorf("msg[%d].hasCalls=%v want %v", i, hasCalls, w.hasCalls)
+				}
+			}
+		})
+	}
+}
+
+// TestNormalizeEmptyContentAllEmpty 全空时不伪造消息、不改动原 slice 语义（原样返回）。
+func TestNormalizeEmptyContentAllEmpty(t *testing.T) {
+	in := []any{
+		map[string]any{"role": "user", "content": ""},
+		map[string]any{"role": "assistant", "content": nil},
+	}
+	out, changed := normalizeEmptyContent(in)
+	if changed {
+		t.Fatalf("all-empty should report unchanged, got changed=true out=%#v", out)
+	}
+	if len(out) != 2 {
+		t.Fatalf("all-empty must keep original messages, got %d", len(out))
+	}
+}

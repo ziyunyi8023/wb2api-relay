@@ -58,6 +58,11 @@ func TestClassify(t *testing.T) {
 		{400, `{"error":{"code": "11135", "message":"image invalid"}}`, ErrImageInvalid},
 		// 防过宽：11133（模型不支持图片）不进 image_invalid。
 		{400, `{"code": 11133, "msg":"model does not support image"}`, ErrClient},
+		// 11151 空 content 消息：确定性请求级错误，fail-fast 不轮转（防伪装 no_healthy_account）。
+		{400, `{"code":11151,"msg":"a message has empty content, please check the conversation history and retry","requestId":"cc695d3fb39e8a871d03b3aa3a450df9","extError":{"code":"400001","message":"a message has empty content, please check the conversation history and retry","param":"","type":"invalid_request_error","StatusCode":400}}`, ErrEmptyContent},
+		{400, `{"code": 11151, "msg":"a message has empty content"}`, ErrEmptyContent},
+		{400, `{"code":"400001","message":"a message has empty content"}`, ErrEmptyContent},
+		{400, `a message has empty content, please check the conversation history and retry`, ErrEmptyContent},
 		{200, `quota exceeded`, ErrHardCredit},
 		// session 死亡优先于限流文案（401+12153 需人工重登，短冷却无意义）。
 		{401, `{"code":12153,"msg":"Offline user session not found, rate limit"}`, ErrSessionDead},

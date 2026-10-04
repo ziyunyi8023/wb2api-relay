@@ -58,6 +58,7 @@ func PrepareBodyOptWithEffortsAndDefault(src []byte, sanitize bool, efforts map[
 	if msgs, ok := obj["messages"].([]any); ok {
 		msgs, _ = repackToolResultBlocks(msgs)
 		msgs, _ = cleanupOrphanToolCalls(msgs)
+		msgs, _ = normalizeEmptyContent(msgs)
 		// 无改动时两步都返回原 slice，这里回写等于零操作；任一步重排/删除
 		// （哪怕后续步骤零改动）也必须落到 obj——不能只在「最后一步改动」时回写，
 		// 否则 repack 单独生效的结果会被原 slice 覆盖丢失。
@@ -252,8 +253,94 @@ func normalizeImageURL(obj map[string]any) {
 	}
 }
 
+// isEmptyContent 判定消息 content 是否会被上游判为「空」（400 11151）。
+// 缺键/显式 null/空串/空数组/全空 text part 都算空；图片等非 text part 有内容则非空。
+func isEmptyContent(v any) bool {
+	if v == nil {
+		return true
+	}
+	switch c := v.(type) {
+	case string:
+		return c == ""
+	case []any:
+		if len(c) == 0 {
+			return true
+		}
+		for _, p := range c {
+			pm, ok := p.(map[string]any)
+			if !ok {
+				return false // 未知形态保守视为有内容
+			}
+			t, _ := pm["type"].(string)
+			switch t {
+			case "text":
+				if s, _ := pm["text"].(string); s != "" {
+					return false
+				}
+			case "image_url", "image", "input_audio", "file":
+				return false
+			default:
+				return false
+			}
+		}
+		return true
+	default:
+		return false
+	}
+}
+
+// normalizeEmptyContent 出站前消除空 content 消息，防上游 400 11151
+// 「a message has empty content」。该错误是确定性请求级拒绝（同 body 换号照样 400），
+// 历史来源多为工具轮次后 assistant 只剩 tool_calls、content 被清成 ""/null。
+//
+//   - assistant + tool_calls 且 content 空 → 删 content 键（OpenAI 合法形态，保留调用）
+//   - tool 结果 content 空 → 改写为占位 "."（保 tool 配对，不能删整条）
+//   - 其余 role content 空 → 整条删除（user/system/无调用 assistant 无语义）
+//   - 全删光时原样返回（不伪造消息，交由 fail-fast/上游报真实错误）
+//
+// 返回清理后的 slice（无改动时等于原 slice）及是否发生改动。
+func normalizeEmptyContent(messages []any) ([]any, bool) {
+	if len(messages) == 0 {
+		return messages, false
+	}
+	out := make([]any, 0, len(messages))
+	changed := false
+	for _, raw := range messages {
+		msg, ok := raw.(map[string]any)
+		if !ok {
+			out = append(out, raw)
+			continue
+		}
+		c, hasContent := msg["content"]
+		if hasContent && !isEmptyContent(c) {
+			out = append(out, msg)
+			continue
+		}
+		role, _ := msg["role"].(string)
+		_, hasCalls := msg["tool_calls"]
+		switch role {
+		case "tool":
+			msg["content"] = "."
+			out = append(out, msg)
+			changed = true
+		case "assistant":
+			if hasCalls {
+				delete(msg, "content")
+				out = append(out, msg)
+			}
+			// 无 tool_calls 的空 assistant：丢弃
+			changed = true
+		default:
+			changed = true
+		}
+	}
+	if !changed || len(out) == 0 {
+		return messages, false
+	}
+	return out, true
+}
+
 // ensureConsoleSystem global realm 兜底 system 注入（吸收 PR #45，防 console 域上游 code 11-128）：
-// 首条消息非 system 时在 messages 最前补一条 fallback system（"You are a helpful assistant."）。
 // 仅对 global 请求调用（CN 现状不动；即使首条就是 system 也不重复注入）。
 // body 不可解析时原样返回（与 prepareBody 语义一致：坏 body 不在这里二次错误化）。
 func ensureConsoleSystem(body []byte) []byte {
