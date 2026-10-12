@@ -45,3 +45,9 @@ docs/
 *.zip
 server.exe
 .DS_Store
+
+# local build outputs (relay-optimization)
+/wb2api-new.exe
+/wb2api-drain.exe
+
+/wb2api-enc.exe

@@ -277,6 +277,41 @@ func TestBadSoftRateMax(t *testing.T) {
 	}
 }
 
+func TestModelRateLimitMaxParsedFromFile(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"cooldown":{"model_rate_limit_max":"8h"}}`), 0o600)
+	c, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.ModelRateLimitMaxDur.Hours() != 8 {
+		t.Errorf("model_rate_limit_max=%v want 8h", c.ModelRateLimitMaxDur)
+	}
+}
+
+func TestModelRateLimitMaxEmptyFallsBackToDefault(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"cooldown":{"soft_rate":"90s"}}`), 0o600)
+	c, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.ModelRateLimitMaxDur.Hours() != 12 {
+		t.Errorf("model_rate_limit_max=%v want 12h fallback", c.ModelRateLimitMaxDur)
+	}
+}
+
+func TestBadModelRateLimitMax(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"cooldown":{"model_rate_limit_max":"oops"}}`), 0o600)
+	if _, err := Load(fp); err == nil {
+		t.Fatal("want error for bad model_rate_limit_max")
+	}
+}
+
 func TestBadBreakerCooldown(t *testing.T) {
 	dir := t.TempDir()
 	fp := filepath.Join(dir, "c.json")

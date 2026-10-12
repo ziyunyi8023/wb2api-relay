@@ -67,6 +67,11 @@ type Config struct {
 	// 且与 pool 的每账号累计器同源，两条口径不会漂移。
 	Usage *usage.Recorder
 
+	// Drain 触发优雅停机的回调（可选；nil = /debug/drain 返回 501）。
+	// 与 SIGTERM 同路径（落盘 + srv.Shutdown 等在飞或超时后退出）；Windows 下
+	// 看门狗无法向隐藏进程发信号，HTTP 触发是运维侧的等价入口。
+	Drain func()
+
 	// RequestLog 请求指标与脱敏 JSONL 归档（可选；nil = 不记录）。
 	RequestLog *reqlog.Recorder
 
@@ -139,6 +144,7 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
 	h.mux.HandleFunc("GET /healthz", h.healthz)
+	h.mux.HandleFunc("POST /debug/drain", h.withAuth(h.drain))
 	if cfg.Panel != nil {
 		h.mux.Handle("/panel/", cfg.Panel) // /panel → /panel/ 由 ServeMux 自动重定向
 	}
@@ -166,6 +172,20 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.mux.ServeHTTP(w, r)
+}
+
+// drain POST /debug/drain：触发优雅停机。先应答 202 再异步走 SIGTERM 同路径，
+// 确保响应送达后才进入 Shutdown（在飞请求保留至 drain 窗口结束）。
+func (h *Handler) drain(w http.ResponseWriter, r *http.Request) {
+	if h.cfg.Drain == nil {
+		http.Error(w, `{"error":"drain not wired"}`, http.StatusNotImplemented)
+		return
+	}
+	log.Printf("[drain] requested")
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusAccepted)
+	_, _ = w.Write([]byte(`{"status":"draining"}`))
+	go h.cfg.Drain()
 }
 
 func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {
@@ -908,6 +928,22 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				st.outcome = reqlog.OutcomeHTTPError
 				return
 			}
+			// 11151「a message has empty content」：确定性请求级错误，立即透传原文，
+			// 不罚号不轮转。同一 body 换任何账号都是 400；若继续轮号，末端会把真实
+			// 原因伪装成 503 no_healthy_account（账号耗尽假象）。
+			if kind == upstream.ErrEmptyContent {
+				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
+				fail(acct.UID)
+				msg := string(respBody)
+				if strings.TrimSpace(msg) == "" {
+					msg = "a message has empty content, please check the conversation history and retry"
+				}
+				writeOpenAIErrorHint(w, http.StatusBadRequest, "empty_content", msg,
+					h.hintOf(upstream.ErrEmptyContent, string(respBody), bareModel, reqHasImage, uerr))
+				st.status = http.StatusBadRequest
+				st.outcome = reqlog.OutcomeHTTPError
+				return
+			}
 			// 请求体解析失败（11101）：与 11115 / 图片无效同一哲学——同一 body 换任何
 			// 账号都是同样的解析结果，轮转只会放大无效请求（每号一次上游调用 +
 			// rotateBackoff 占用在途名额）。更要紧的是：继续轮转后末端会落到
@@ -937,6 +973,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 加重风控。账号级软冷却已在上方 applyErrorPolicy 照常记账。
 			if kind == upstream.ErrWafBlock && h.wafIP.noteWaf(acct.UID) {
 				break
+			}
+			// 账号停车场（软限/硬限/模型级）→ 零等待换新号；其余（WAF/网络/5xx）
+			// 保留指数退避防出口放大。
+			if !rotateNeedsBackoff(kind) {
+				continue
 			}
 			if !rotateBackoff(i, r.Context()) {
 				break // ctx 取消：终止轮转（分类错误换号退避）
@@ -1277,6 +1318,8 @@ func isUpstreamTimeout(err error, clientGone bool) bool {
 //   - ErrImageInvalid → 图片格式/数据无效：请求的问题不是账号的问题（同一 body
 //     换任何号都会得到相同的解析错误）。零动作（不冷却/不熔断/不 NoteError、
 //     不喂连败），chatCompletions 已直接透传原文返回不轮转。
+//   - ErrEmptyContent → 11151 空 content 消息：请求的问题不是账号的问题。零动作，
+//     chatCompletions 已 fail-fast 透传原文返回不轮转。
 //   - ErrModelBlocked → BlockModelBackoff：(账号, 模型) 11102 负缓存避让。
 //   - ErrServer → NoteError：喂单一连续失败计数器 fails + 累计错误 errTotal，
 //     达到 breakerThreshold 触发熔断（指数退避）。
@@ -1362,6 +1405,8 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 	case upstream.ErrImageInvalid:
 		// 图片格式/数据无效：请求的问题不是账号的问题（同一 body 换任何号都会
 		// 得到相同解析错误）。零动作，chatCompletions 已 fail-fast 透传。
+	case upstream.ErrEmptyContent:
+		// 11151 空 content 消息：请求的问题不是账号的问题。零动作，fail-fast 透传。
 	case upstream.ErrBadParams:
 		// 请求体解析失败（400 + Unmarshal chat params failed / 11101）：发给上游的 body
 		// 有问题（网关侧不再截断，均为客户端畸形 JSON）。换了账号照样 400，
