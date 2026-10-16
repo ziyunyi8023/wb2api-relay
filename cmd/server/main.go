@@ -31,7 +31,7 @@ import (
 )
 
 // appVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
-const appVersion = "1.13.0-panel"
+const appVersion = "1.13.0-panel-head6b31db6-hb"
 
 // usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
 // 这样 config 里改 state_file 时用量数据跟着走，不需要额外配置项。
@@ -317,6 +317,8 @@ func main() {
 		StickyCount:  sessCount,
 		RedisMode:    redisMode,
 		SoftCooldown: cfg.SoftRateDur,
+		// 客户端静默心跳（upstream.sse_heartbeat_seconds，缺省 15s；<=0 关闭）。
+		SSEHeartbeat: cfg.SSEHeartbeatDur,
 		Panel:        pn,
 		Live:         live,
 		Usage:        rec,

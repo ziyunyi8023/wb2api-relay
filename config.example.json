@@ -45,6 +45,7 @@
     "timeout_seconds": 120,
     "header_timeout_seconds": 120,
     "idle_timeout_seconds": 300,
+    "sse_heartbeat_seconds": 15,
     "user_agent": "",
     "client_version": "",
     "cli_version": "",

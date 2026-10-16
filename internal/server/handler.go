@@ -42,6 +42,11 @@ type Config struct {
 	RedisMode    string
 	SoftCooldown time.Duration // 429/限流文案软冷却基数，默认 600s（连续触发指数退避，封顶 soft_rate_max）
 	RefreshSkew  time.Duration // token 提前刷新窗口，默认 10m
+	// SSEHeartbeat 聊天 SSE 客户端静默心跳间隔（<=0 = 关闭；来自 config
+	// upstream.sse_heartbeat_seconds，缺省 15s）：等上游首字节 / 流中停摆时按此间隔写
+	// ": hb" 注释帧，避免客户端或中间层的空闲读超时先于网关掐断连接
+	// （见 internal/upstream.WithHeartbeat）。
+	SSEHeartbeat time.Duration
 
 	// Panel 管理面板 handler（可选；nil = 不挂载）。挂载在 /panel/ 前缀下，
 	// 面板自带 Bearer 鉴权（同一 api_key）与内嵌静态资源，主路由只做转发。
@@ -1021,7 +1026,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			sErr := upstream.StreamHint(w, stats, upstream.FrameHintFunc(func() upstream.HintContext {
 				return h.hintContext(bareModel, reqHasImage)
 			}), upstream.WithErrorFrameObserver(func(payload string) { errFrame = payload }),
-				upstream.WithMarkupRepair(repair))
+				upstream.WithMarkupRepair(repair),
+				// 客户端静默心跳：<=0 时 WithHeartbeat 内部不启动任何 goroutine。
+				upstream.WithHeartbeat(h.cfg.SSEHeartbeat))
 			switch {
 			case upstream.IsEmptyStreamError(sErr):
 				// 上游 200 但空流（0 有效帧）：StreamHint 已写 error 帧 + [DONE]

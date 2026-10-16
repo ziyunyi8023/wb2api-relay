@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -485,6 +486,8 @@ type StreamOption func(*streamOptions)
 type streamOptions struct {
 	onErrorFrame func(payload string)
 	markup       *MarkupRepair
+	// heartbeat 客户端静默心跳间隔（<=0 = 关闭，见 WithHeartbeat）。
+	heartbeat time.Duration
 }
 
 // WithMarkupRepair 注册「模型原生工具调用标记」修复器（见 dsml.go）。
@@ -504,6 +507,21 @@ func WithMarkupRepair(r *MarkupRepair) StreamOption {
 // 第一帧之前就把账号记成功，限流号被当成健康号；有观察者后可在流尾按帧分类处置。
 func WithErrorFrameObserver(fn func(payload string)) StreamOption {
 	return func(o *streamOptions) { o.onErrorFrame = fn }
+}
+
+// WithHeartbeat 注册客户端静默心跳（<=0 = 关闭）：等待上游首字节、以及流中停摆
+// 期间，每隔 d 向客户端写一行 SSE 注释帧 ": hb" 并 flush。
+//
+// 存在理由：上游一个字都还没吐时，网关只是阻塞在读上游的 ReadString 上，
+// 客户端拿不到任何字节（连 200 响应头都要等 Go 的首次 Write 才发出）；而客户端侧
+// 的空闲读超时、以及 Clash TUN/代理等中间层的空闲上限，都远短于网关自己的
+// 60s 首字节 / 300s 流中耐心——于是客户端先于网关掐断连接，用户看到「流断了」。
+// 注释帧在 SSE 规范里合法、合规客户端必须忽略：不进 content、不计 token、
+// 不参与「空流」判定，也不影响 [DONE] 收尾。
+//
+// 缺省不启用（需显式挂上）：调用方按 upstream.sse_heartbeat_seconds 决定。
+func WithHeartbeat(d time.Duration) StreamOption {
+	return func(o *streamOptions) { o.heartbeat = d }
 }
 
 // StreamHint 同 Stream，但上游 error 帧透出前把 hintFn(payload) 的返回值写入
@@ -544,15 +562,27 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 	maxToolIdx := -1
 	toolFinishSent := false
 
-	// writeSSE 原样写出一帧并 flush。
-	writeSSE := func(payload string) error {
-		if _, werr := io.WriteString(w, "data: "+payload+"\n\n"); werr != nil {
+	// hbMu 串行化全部出站写。挂了客户端静默心跳后，写者不再只有读循环一个
+	// goroutine：心跳 ticker 与读循环并发写同一个 ResponseWriter，不串行化会
+	// 出现字节交错——SSE 里就是坏帧（": hb" 插进 "data: {...}" 中间）。
+	var hbMu sync.Mutex
+
+	// writeLocked 写出原始字节并 flush（所有出站写的唯一入口）。
+	writeLocked := func(s string) error {
+		hbMu.Lock()
+		defer hbMu.Unlock()
+		if _, werr := io.WriteString(w, s); werr != nil {
 			return werr
 		}
 		if fl != nil {
 			fl.Flush()
 		}
 		return nil
+	}
+
+	// writeSSE 原样写出一帧并 flush。
+	writeSSE := func(payload string) error {
+		return writeLocked("data: " + payload + "\n\n")
 	}
 
 	// writeRaw 原样写出一帧（绕过 normalizeFrame）。上游 error 帧（error-passthrough）
@@ -707,6 +737,38 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 		return 1, nil
 	}
 
+	// 客户端静默心跳（WithHeartbeat）：见 WithHeartbeat 注释。第一拍立即写一次，
+	// 把 200 响应头尽早送出去（上游已确定 200 开流，调用方只在成功响应后进入本
+	// 函数，提前写头安全）；此后每 d 一拍，直到函数返回。
+	if o.heartbeat > 0 {
+		hbStop := make(chan struct{})
+		hbDone := make(chan struct{})
+		go func() {
+			defer close(hbDone)
+			t := time.NewTicker(o.heartbeat)
+			defer t.Stop()
+			if werr := writeLocked(": hb\n\n"); werr != nil {
+				return // 客户端已走：让读循环的写失败路径去暴露错误
+			}
+			for {
+				select {
+				case <-hbStop:
+					return
+				case <-t.C:
+					if werr := writeLocked(": hb\n\n"); werr != nil {
+						return
+					}
+				}
+			}
+		}()
+		// 返回前停拍并等心跳 goroutine 退出：否则它可能在 handler 已返回后继续写
+		// 已复用的 ResponseWriter。
+		defer func() {
+			close(hbStop)
+			<-hbDone
+		}()
+	}
+
 	br := bufio.NewReaderSize(r, 64*1024)
 	validFrames := 0
 readLoop:
@@ -725,12 +787,9 @@ readLoop:
 				return werr
 			}
 		case trimmed != "":
-			// 注释/其他行：原样透传
-			if _, werr := io.WriteString(w, line); werr != nil {
+			// 注释/其他行：原样透传（走 writeLocked：与心跳 goroutine 串行化）
+			if werr := writeLocked(line); werr != nil {
 				return werr
-			}
-			if fl != nil {
-				fl.Flush()
 			}
 		}
 		// 空行（帧分隔）吞掉：本函数自产 "\n\n"
@@ -772,11 +831,8 @@ readLoop:
 		_ = writeRaw(`{"error":{"message":"empty upstream stream","type":"upstream_error","code":"upstream_parse"}}`)
 	}
 	// 保证恰好写一个 [DONE]（上游漏发时兜底补上）。
-	if _, err := io.WriteString(w, "data: [DONE]\n\n"); err != nil {
-		return err
-	}
-	if fl != nil {
-		fl.Flush()
+	if werr := writeLocked("data: [DONE]\n\n"); werr != nil {
+		return werr
 	}
 	if validFrames == 0 {
 		return errEmptyStream

@@ -15,6 +15,10 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/prompt"
 )
 
+// defaultSSEHeartbeat 客户端静默心跳的缺省间隔（config upstream.sse_heartbeat_seconds
+// 未设置时生效）。15s 是"抢在客户端/中间层空闲超时之前"的量级选择：等太久等于没做。
+const defaultSSEHeartbeat = 15 * time.Second
+
 // Config 顶层配置。
 type Config struct {
 	Listen    string `json:"listen"`     // ":7863"
@@ -142,6 +146,12 @@ type Config struct {
 		HeaderTimeoutSeconds int `json:"header_timeout_seconds"`
 		// IdleTimeoutSeconds 聊天 SSE 流中空闲上限（活跃吐数据续命不掐）；<=0 回落默认 300。
 		IdleTimeoutSeconds int `json:"idle_timeout_seconds"`
+		// SSEHeartbeatSeconds 客户端静默心跳间隔（秒）：等待上游首字节 / 流中停摆期间
+		// 每隔此值向客户端写一行 SSE 注释帧 ": hb" 并 flush，避免客户端侧或中间层
+		// （Clash TUN、代理）的空闲读超时先于网关把连接掐掉（见
+		// internal/upstream.WithHeartbeat）。缺省 / 0 = 默认 15 秒；负数 = 显式关闭
+		// （逃生门：客户端不认注释帧时用。0 一律视为"未设置"，与本文件既有约定一致）。
+		SSEHeartbeatSeconds int `json:"sse_heartbeat_seconds"`
 		// UserAgent 出站 User-Agent 显式覆盖（非空时全路径生效，优先于默认三段式）。
 		// 全部出站请求生效：chat/refresh/checkin/balance/report/travel/FetchModels。
 		// 默认值已对齐官方 WorkBuddy 桌面形态（三段式），用户仍可配完全自定义值改写。
@@ -243,6 +253,9 @@ type Config struct {
 	CostExploreIntervalDur time.Duration `json:"-"`
 	// ServerReadTimeoutDur 解析后的入站请求读取上限（issue #100）；0 = 不限制。
 	ServerReadTimeoutDur time.Duration `json:"-"`
+	// SSEHeartbeatDur 客户端静默心跳间隔（由 Upstream.SSEHeartbeatSeconds 解析；
+	// 缺省 15s，<=0 = 关闭）。见 internal/upstream.WithHeartbeat。
+	SSEHeartbeatDur time.Duration `json:"-"`
 }
 
 // Default 默认配置。
@@ -284,6 +297,9 @@ func Default() *Config {
 	// HeaderTimeoutSeconds/IdleTimeoutSeconds 默认 0（未设置态），回落见 normalize()。
 	c.Upstream.HeaderTimeoutSeconds = 0
 	c.Upstream.IdleTimeoutSeconds = 0
+	// SSEHeartbeatSeconds 默认 0（未设置态 → normalize 回落 defaultSSEHeartbeat）；
+	// 负数 = 显式关闭。
+	c.Upstream.SSEHeartbeatSeconds = 0
 	// Global.Enabled 缺省 true（纯 CN 行为不变：CN 账号恒判 cn，global base 不被使用）；
 	// ChatBase/BillingBase 缺省空（回落内置默认）。
 	c.Global.Enabled = true
@@ -587,6 +603,17 @@ func (c *Config) normalize() error {
 	}
 	if c.Upstream.IdleTimeoutSeconds <= 0 {
 		c.Upstream.IdleTimeoutSeconds = 300
+	}
+	// 客户端静默心跳（缺省 15s）：比上面两个「网关自己的耐心」短一个量级——它的
+	// 作用正是抢在客户端/中间层掐连接之前给出字节，等太久就等于没做。
+	// 负数 = 显式关闭（客户端不认注释帧时的逃生门）。
+	switch {
+	case c.Upstream.SSEHeartbeatSeconds > 0:
+		c.SSEHeartbeatDur = time.Duration(c.Upstream.SSEHeartbeatSeconds) * time.Second
+	case c.Upstream.SSEHeartbeatSeconds < 0:
+		c.SSEHeartbeatDur = 0
+	default:
+		c.SSEHeartbeatDur = defaultSSEHeartbeat
 	}
 	if !strings.HasPrefix(c.Listen, ":") && !strings.Contains(c.Listen, ":") {
 		c.Listen = ":" + c.Listen
