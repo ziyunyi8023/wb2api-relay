@@ -379,7 +379,7 @@ curl -s http://localhost:7863/v1/chat/completions \
 | `upstream.timeout_seconds` | `120` | 短 RPC（刷新 / 签到 / 余额 / 模型列表）总时长上限 |
 | `upstream.header_timeout_seconds` | 回落 `timeout_seconds` | 聊天首字节前（响应头）上限 |
 | `upstream.idle_timeout_seconds` | `300` | 聊天流中空闲上限（活跃续命，静默断流） |
-| `upstream.sse_heartbeat_seconds` | `15` | 客户端静默心跳间隔：等上游首字节 / 流中停摆时按此间隔写 `: hb` 注释帧（SSE 规范合法、合规客户端忽略）保活，防客户端与中间层空闲读超时；`0`/缺省 = 15 秒，**负数 = 关闭** |
+| `upstream.sse_heartbeat_seconds` | `15` | 客户端心跳间隔：**整条流期间**按此间隔写 `: hb` 注释帧（SSE 规范合法、合规客户端忽略，不计内容 / token），首拍在开流时立即写 —— 上游 ttfb 可达数十秒，没有它客户端 / 中间层会按空闲读超时掐断。`0`/缺省 = 15 秒，**负数 = 关闭** |
 | `upstream.user_agent` | 空 | 出站 User-Agent 覆盖（空 = 现状 `CLI/2.63.2 CodeBuddy/2.63.2`）。官网「使用端」列按出站 UA 服务端归因；官方 WorkBuddy 桌面 UA 为 `WorkBuddy/<version>`，需要时可配 |
 | `features.sanitize_blacklist_fingerprints` | `true` | 出站请求体黑名单指纹脱敏 |
 | `prompt.mode` | `custom` | 系统提示词模式：`custom` = 网关用自有提示词替换客户端 system；`append` = 开头连续 system/developer 块后插网关提示词（既有消息逐字不动）；`passthrough` = 透传客户端原始 system（降级重试仍切中性提示词） |
@@ -409,7 +409,7 @@ curl -s http://localhost:7863/v1/chat/completions \
 | `timeout_seconds` | 短 RPC（token 刷新 / 签到 / 余额 / 模型列表） | `120` | 总时长硬上限，到期报错走换号 / 熔断 |
 | `header_timeout_seconds` | 聊天 SSE **首字节前** | `120` | 由 `Transport.ResponseHeaderTimeout` 约束；超时 = 换号重发 |
 | `idle_timeout_seconds` | 聊天 SSE **流中空闲** | `300` | 活跃吐数据续命不掐；静默超时才断流释放租约 |
-| `sse_heartbeat_seconds` | 聊天 SSE **客户端侧保活** | `15` | 静默期按间隔写 `: hb` 注释帧（不计入内容 / token，不参与空流判定）；`0`/缺省 = 15 秒，负数 = 关闭 |
+| `sse_heartbeat_seconds` | 聊天 SSE **客户端侧保活** | `15` | 整条流期间每 15 秒写一次 `: hb` 注释帧（首拍立即；不计内容 / token，不参与空流判定）；`0`/缺省 = 15 秒，负数 = 关闭 |
 
 聊天流（`stream` true / false 均同）**没有总时长上限**：聊天使用 `Timeout=0` 的专用 client，长思考 / 长输出不会被掐断。
 
