@@ -32,7 +32,7 @@ import (
 )
 
 // appVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
-const appVersion = "1.13.0-panel-head6b31db6-hb"
+const appVersion = "1.14.0-panel-up20261021-hb-convid-wait-xdomain"
 
 // usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
 // 这样 config 里改 state_file 时用量数据跟着走，不需要额外配置项。
@@ -120,6 +120,8 @@ func main() {
 	p.SetWeights(cfg.Pool.IdleWeightPerHour, cfg.Pool.IdleWeightMax)
 	p.SetPreferExpiring(cfg.Pool.PreferExpiring)
 	p.SetCrossDomainFallback(cfg.Pool.CrossDomainFallback) // 裸名跨域回退（issue #135，默认关闭）
+	p.SetCrossDomainFallbackExplicit(cfg.Pool.CrossDomainFallbackExplicit) // 显式前缀也回退（默认关闭）
+	p.SetWaitTimeout(cfg.PoolWaitDur)                      // 在途饱和等待上限（pool.wait_timeout）
 	_ = p.SetScheduling(cfg.Pool.Strategy, cfg.Pool.AccountOrder)
 
 	// 会话粘性路由（可配关闭）。
@@ -149,6 +151,7 @@ func main() {
 		return 0
 	}
 
+	upstream.SetGzipMinBytes(cfg.Upstream.GzipMinBytes) // 出站 body gzip 阈值（0=关闭）
 	up := upstream.New()
 
 	// 积分保底的「收费」兜底判据：接上游模型目录的积分倍率表。本地实测台账无观测
@@ -471,7 +474,7 @@ func panelListenPath(listen string) string {
 //
 // 热生效范围（设计取舍）：
 //   - api_key / cooldown.soft_rate / features.sanitize_blacklist_fingerprints → livecfg 快照
-//   - pool.* → pool.SetBreaker/SetMaxInFlight/SetSoftRateMax/SetModelRateLimitMax/SetWeights/SetCostExploreInterval/SetPreferExpiring/SetCreditFloor
+//   - pool.* → pool.SetBreaker/SetMaxInFlight/SetSoftRateMax/SetModelRateLimitMax/SetWeights/SetCostExploreInterval/SetPreferExpiring/SetCreditFloor/SetWaitTimeout
 //   - schedule.* → scheduler.Reconfigure/SetBalanceInterval/SetExpiringSoonWindow
 //
 // 需重启（涉及监听地址、HTTP client 超时、auth_dir 等装配期依赖）：
@@ -559,6 +562,8 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	p.SetWeights(newCfg.Pool.IdleWeightPerHour, newCfg.Pool.IdleWeightMax)
 	p.SetPreferExpiring(newCfg.Pool.PreferExpiring)
 	p.SetCrossDomainFallback(newCfg.Pool.CrossDomainFallback) // 裸名跨域回退热生效（issue #135）
+	p.SetCrossDomainFallbackExplicit(newCfg.Pool.CrossDomainFallbackExplicit) // 显式前缀回退热生效
+	p.SetWaitTimeout(newCfg.PoolWaitDur)                      // 在途饱和等待热生效（pool.wait_timeout）
 	_ = p.SetScheduling(newCfg.Pool.Strategy, newCfg.Pool.AccountOrder)
 	sch.SetExpiringSoonWindow(newCfg.ExpiringSoonDur)
 	sch.Reconfigure(

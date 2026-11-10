@@ -826,7 +826,7 @@ type CreditObserver func(uid string, credits int64)
 // TLS 握手超时 / 短 keepalive 探测 / 失败清池，参数见 transport.go——吸收上游
 // kongjianguan 4 连击实测经验）。
 func New() *Client {
-	tr := newTransport()
+	tr := wrapGzip(newTransport())
 	c := &Client{
 		HTTP:          &http.Client{Timeout: 120 * time.Second, Transport: tr},
 		ChatHTTP:      &http.Client{Timeout: 0, Transport: tr}, // 无总时长；首字节由 ResponseHeaderTimeout 管

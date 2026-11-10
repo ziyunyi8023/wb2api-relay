@@ -365,6 +365,40 @@ func (p *Pool) inFlightFull(e *entry) bool {
 	return e.inFlight.Load() >= int64(limit)
 }
 
+// SaturatedCountFor 报告「realm + 模型健康、未被积分保底拦、只因在途名额占满而不可选」
+// 的账号数。与 pick 的差别只有一处：把 inFlightFull 的号**计出来**而不是跳过。
+//
+// 用途是让上层区分 acct == nil 的两种成因：
+//   - 返回值 > 0：名额都压在健康号上，请求完成后会释放 ⇒ 值得等一会儿再选；
+//   - 返回值 == 0：号真的不可用（冷却/禁用/模型级阻塞/积分保底）⇒ 等也没用。
+//
+// 纯观测：不改选号状态（不加权、不记 lastUsed、不清理冷却）。调用方无需持锁。
+func (p *Pool) SaturatedCountFor(realm, reqModel string) int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	now := time.Now()
+	n := 0
+	for _, e := range p.byUID {
+		if realm != "" && e.a.Realm() != realm {
+			continue
+		}
+		healthy := e.healthy(now)
+		if reqModel != "" {
+			healthy = e.healthyForModel(now, reqModel)
+		}
+		if !healthy {
+			continue
+		}
+		if p.floorBlockedForRealmModel(e, reqModel, realm, now) {
+			continue
+		}
+		if p.inFlightFull(e) {
+			n++
+		}
+	}
+	return n
+}
+
 // minPickGap 防并发撞号窗口：同一账号在该窗口内不重复被选中（除非 top5 全部刚被用过）。
 // 生产默认 100ms；纯加权分布测试可临时置 0 关闭防撞号。
 var minPickGap = 100 * time.Millisecond

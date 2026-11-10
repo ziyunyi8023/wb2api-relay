@@ -189,6 +189,9 @@ type Config struct {
 		DeviceToken string `json:"device_token"`
 		// DeviceTokenFile device token 文件路径兜底（宿主落盘的桌面端 token，5 分钟读取缓存）。
 		DeviceTokenFile string `json:"device_token_file"`
+		// GzipMinBytes 出站请求体 gzip 压缩阈值（字节）：ContentLength >= 此值才压。
+		// 0 = 关闭（默认）。对齐官方客户端形态用；上游未验证接受时不要打开。
+		GzipMinBytes int `json:"gzip_min_bytes"`
 		// PassthroughIP 是否透传客户端 IP 给上游（默认 false，反代安全边界）。
 		PassthroughIP bool `json:"passthrough_ip"`
 	} `json:"upstream"`
@@ -264,6 +267,16 @@ type Config struct {
 		// 另一域再选一次；显式 cn:/global: 前缀不受影响，行为与引入前完全一致。
 		// 语义取舍：跨域会消耗另一个域的额度，属策略选择，故默认关闭、显式开启。
 		CrossDomainFallback bool `json:"cross_domain_fallback"`
+		// CrossDomainFallbackExplicit 允许显式 cn:/global: 前缀的请求参与跨域回退，
+		// 默认 false（保持上游 issue #135 的「显式前缀永不回退」语义）。
+		// 打开后：global: 请求在 global 域该模型无可服务账号、cn 域还有健康号时换域
+		// 顶替，而不是回 503；关掉即恢复「写 global: 就只用 global 号」。
+		CrossDomainFallbackExplicit bool `json:"cross_domain_fallback_explicit"`
+
+		// WaitTimeout 在途名额等待上限（如 "15s"）：健康号都在、只是每号的
+		// max_in_flight 名额被占满时，选号最多等这么久再判失败，避免把并发高峰
+		// 变成 503 风暴。""/0/负值 = 关闭等待（旧行为：名额满立刻 503）。
+		WaitTimeout string `json:"wait_timeout"`
 	} `json:"pool"`
 
 	SessionSticky struct {
@@ -292,6 +305,8 @@ type Config struct {
 	// SSEHeartbeatDur 客户端静默心跳间隔（由 Upstream.SSEHeartbeatSeconds 解析；
 	// 缺省 15s，<=0 = 关闭）。见 internal/upstream.WithHeartbeat。
 	SSEHeartbeatDur time.Duration `json:"-"`
+	// PoolWaitDur 解析后的在途名额等待上限（pool.wait_timeout；缺省 15s，<=0 = 关闭）。
+	PoolWaitDur time.Duration `json:"-"`
 }
 
 // Default 默认配置。
@@ -350,6 +365,9 @@ func Default() *Config {
 	// P1-1）；0/负数 normalize 回落默认（与 max_in_flight 的 0=不限语义不同，分档键
 	// 的 0 没有合理语义，回退分档默认最稳）。
 	c.Pool.MaxInFlightGlobal = 2
+	// WaitTimeout 缺省 15s：够吸收一次并发小高峰（名额按请求完成释放），又不至于
+	// 把客户端拖过它自己的读超时。0/负值 = 关闭等待（名额满立刻 503 的旧行为）。
+	c.Pool.WaitTimeout = "15s"
 	c.Pool.BreakerThreshold = 3
 	c.Pool.BreakerCooldown = "30m"
 	c.Pool.BreakerCooldownMax = "6h"
@@ -582,6 +600,17 @@ func (c *Config) normalize() error {
 	}
 	if c.DegradeCooldownMaxD, err = time.ParseDuration(c.Pool.DegradeCooldownMax); err != nil {
 		return fmt.Errorf("pool.degrade_cooldown_max: %w", err)
+	}
+	// 在途名额等待上限：空值回落默认 15s（Default() 已置值，此兜底覆盖显式 ""）；
+	// 负值钳 0 = 关闭等待。解析失败 fail fast（拼写错误不该静默关掉等待）。
+	if c.Pool.WaitTimeout == "" {
+		c.Pool.WaitTimeout = "15s"
+	}
+	if c.PoolWaitDur, err = time.ParseDuration(c.Pool.WaitTimeout); err != nil {
+		return fmt.Errorf("pool.wait_timeout: %w", err)
+	}
+	if c.PoolWaitDur < 0 {
+		c.PoolWaitDur = 0
 	}
 	if c.SessionTTL, err = time.ParseDuration(c.SessionSticky.TTL); err != nil {
 		return fmt.Errorf("session_sticky.ttl: %w", err)

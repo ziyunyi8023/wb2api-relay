@@ -67,6 +67,11 @@ type Pool struct {
 	// 仅由选号调用方（server handler）读取：开启后，未带 realm 前缀的请求在首选域
 	// 选不到可用号时改用另一域再选一次；显式 cn:/global: 前缀不受影响。
 	crossDomainFallback bool
+	// waitTimeout 在途饱和等待上限（config pool.wait_timeout，0 = 关闭等待）。
+	waitTimeout time.Duration
+	// crossDomainFallbackExplicit 允许显式 cn:/global: 前缀的请求也参与跨域回退。
+	// 上游 issue #135 的语义是「显式前缀永不回退」；打开本开关才放开。
+	crossDomainFallbackExplicit bool
 	// maxInFlight 单账号最大在途请求数；0 = 不限（租约关闭）。
 	maxInFlight int
 	// maxInFlightGlobal global 域单账号在途上限分档（WAF 403 修复 P1-1：global 域
@@ -219,6 +224,36 @@ func (p *Pool) SetPreferExpiring(enabled bool) {
 	p.preferExpiring = enabled
 }
 
+// SetWaitTimeout 注入在途饱和等待上限（config pool.wait_timeout）。
+// 与其它 pool.* 参数一致走热应用路径：面板保存后立即生效，无需重启。
+// 非正值 = 关闭等待（名额满立刻 503 的旧行为）。
+func (p *Pool) SetWaitTimeout(d time.Duration) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.waitTimeout = d
+}
+
+// WaitTimeout 报告在途饱和等待上限当前值（handler 侧只读，热改安全）。
+func (p *Pool) WaitTimeout() time.Duration {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.waitTimeout
+}
+// SetCrossDomainFallbackExplicit 注入「显式前缀也允许跨域回退」开关。
+// 默认 false = 上游语义（显式 cn:/global: 是确定性路由，永不跨域）；
+// 打开后，带前缀的请求在本域该模型无可服务账号时也允许换域顶替。
+func (p *Pool) SetCrossDomainFallbackExplicit(enabled bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.crossDomainFallbackExplicit = enabled
+}
+
+// CrossDomainFallbackExplicit 报告显式前缀跨域回退开关当前状态（热改安全）。
+func (p *Pool) CrossDomainFallbackExplicit() bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.crossDomainFallbackExplicit
+}
 // SetCrossDomainFallback 注入裸模型名跨域回退开关（issue #135；false = 零回归）。
 // 与其它 pool.* 参数一致，面板保存配置后经同一条热应用路径立即生效。
 func (p *Pool) SetCrossDomainFallback(enabled bool) {

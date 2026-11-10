@@ -613,8 +613,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 跨域回退（issue #135）：只有裸模型名 + 显式开启 pool.cross_domain_fallback 时生效。
 	// 语义 = 「裸名不绑定单一域」：首选域（裸名默认 cn）选不到可用号（账号级冷却/熔断/
 	// 在途占满，或该域账号对这个模型 11102 后进入模型级负缓存）时，改用另一域再选一次；
-	// 显式 cn:/global: 前缀保持原语义，永不回退。
-	crossRealm := !realmExplicit && h.cfg.Pool.CrossDomainFallback()
+	// 显式 cn:/global: 前缀保持原语义，永不回退（除非 pool.cross_domain_fallback_explicit 打开）。
+	// 显式前缀默认不回退（上游语义）；cross_domain_fallback_explicit 打开后，
+	// 带 cn:/global: 前缀的请求在本域该模型无可服务账号时也允许换域顶替。
+	crossRealm := h.cfg.Pool.CrossDomainFallback() && (!realmExplicit || h.cfg.Pool.CrossDomainFallbackExplicit())
 
 	// 请求级统计：出口即打一行表格日志（任何路径都会走到）。
 	st := newChatStat(time.Now(), body, peek.Stream)
@@ -796,7 +798,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 循环外**生成一次，循环内每次出站原样复用 → 换号/重试/降级全部同 ID，后台不再
 	// 碎片化（此前网关一个都不发，上游按 HTTP 请求逐条记账，同一对话几十上百个
 	// RequestID）。
-	//   - conversationID：body 提取（透传客户端原值，缺省空串——不伪造）；
+	//   - conversationID：body / 入站头透传优先，其次会话键，均无则生成请求级兜底；
 	//   - conversationRequestID：入站 X-Conversation-Request-ID 透传优先，否则按
 	//     粘性 key 进程内稳定生成；粘性 key 也空时走轮级兜底（TurnKey/TurnRequestID），
 	//     无 user 消息时退化成本请求级随机——轮转内捕获一次即共享；
@@ -808,7 +810,15 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// prefix-cache slot.
 	convID := session.ResolveConversationID(body)
 	if convID == "" {
+		convID = strings.TrimSpace(r.Header.Get("X-Conversation-ID"))
+	}
+	if convID == "" {
 		convID = sessKey
+	}
+	if convID == "" {
+		// WorkBuddy 渠道校验要求会话头非空（issue #197）。在轮转外生成，
+		// 无会话键的请求也能在换号、重试与降级期间复用同一个 ID。
+		convID = session.NewMessageID()
 	}
 	chatMeta := upstream.ChatMeta{ConversationID: convID}
 	if v := r.Header.Get("X-Conversation-Request-ID"); v != "" {
@@ -828,6 +838,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	chatMeta.TraceID = r.Header.Get("X-Trace-ID")
 
+	saturated := false
+	// waitDeadline 在途饱和等待的**全请求唯一**截止时刻（首次遇到饱和时定下），
+	// 不是每轮一份 —— 否则 MaxRotate 轮各等一个 wait_timeout，最坏拖成 N×。
+	var waitDeadline time.Time
 	for i := 0; i < h.cfg.MaxRotate; i++ {
 		// 选号：粘性号优先（PickByUIDForModel 已校验该模型可用性 + 在途未满），否则普通轮换。
 		var acct *auth.Auth
@@ -860,7 +874,58 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				acct = h.cfg.Pool.PickExcludingForRealm(tried, bareModel, otherRealm(pickRealm))
 			}
 		}
-		if acct == nil {
+		// 选到号之后**先抢名额**，抢到了才算「这个号真的归本次请求」。
+		//
+		// 顺序是本轮修复的根因（2026-10-24 实测）：此前 tried[acct.UID]=true 写在
+		// Acquire 之前，于是「Pick 选中 → CAS 抢名额抢输」这条并发路径把该号记成
+		// 已试过、消耗一格轮转预算，再叠 rotateBackoff 的 0.5/1/2s 退避 ⇒
+		// MaxRotate=3 下三轮全抢输的请求一次上游都没打就报 503 no_healthy_account。
+		// 日志形状正是：account 非空、duration_ms 1.8–7.3s（=退避时长）、无 attempts。
+		// 现在抢输不计 tried、不算换号，回到选号继续找真正有空的号。
+		claimed := false
+		if acct != nil {
+			if h.cfg.Pool.Acquire(acct.UID) {
+				claimed = true
+			} else {
+				// 抢输：名额被并发拿走，或该号刚被判满。粘性号被抢则解绑
+				// （语义与 fail() / PickByUID-nil 的解绑一致），避免下一轮仍撞它。
+				if stickyUID != "" && acct.UID == stickyUID {
+					unbindSticky()
+				}
+				acct = nil // 不是「号不可用」而是「暂时挤」，交给下面的饱和等待
+			}
+		}
+		// 在途饱和：健康号都在，只是每号的在途名额（pool.max_in_flight）被占满。
+		// 名额会随请求完成释放 ⇒ 等一会儿再选，而不是把并发压力直接翻译成 503：
+		// 旧行为让客户端立刻重打，把一次并发高峰放大成重试风暴（实测 2026-10-24
+		// 21 点单小时 25625 条 503，全部 account="-"、duration_ms 2–9ms、零上游请求）。
+		//
+		// 等待窗口**全请求只开一次**（waitDeadline 在循环外算一次），且这段等待
+		// **不消耗 MaxRotate 预算**（acquireWithSlotWait 内部一直重试到 deadline）：
+		// 名额是「暂时被占」，不是「号试过了」，用换号预算去数它会让 3 轮预算在
+		// 十几秒的名额争夺里耗尽，等窗口还没用完就先 break 成 503（生产实测残留）。
+		if !claimed && h.cfg.Pool.WaitTimeout() > 0 && !saturated &&
+			h.cfg.Pool.SaturatedCountFor(realm, bareModel) > 0 {
+			if waitDeadline.IsZero() {
+				waitDeadline = time.Now().Add(h.cfg.Pool.WaitTimeout())
+			}
+			// 每次循环重试「选号 + 抢名额」，抢输立刻再来，直到拿到号或窗口到期。
+			if a := h.acquireWithSlotWait(r.Context(), realm, bareModel, tried, waitDeadline); a != nil {
+				acct = a
+				claimed = true
+			} else {
+				saturated = true // 等满窗口仍挤不出名额：如实回 429，别伪装成「号全挂」
+			}
+		}
+		// 等待关闭时（pool.wait_timeout<=0）抢名额失败不能直接 503：名额被并发
+		// 拿走是「暂时挤」，应换下一个号重试，与引入等待前的行为一致。
+		if !claimed && h.cfg.Pool.WaitTimeout() <= 0 {
+			if !rotateBackoff(i, r.Context()) {
+				break
+			}
+			continue
+		}
+		if !claimed {
 			st.status = http.StatusServiceUnavailable
 			// 记下"是不是模型级阻塞"。选号返回 nil 有两种完全不同的成因：
 			//   (a) 池子真的没有可用号（账号级冷却/在途占满/积分保底）；
@@ -879,20 +944,6 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			modelRate = h.cfg.Upstream.ModelRate(acct.Realm(), bareModel)
 		}
 		tried[acct.UID] = true
-
-		// 占用在途名额：Pick 已跳过满额账号，此处 CAS 兜底并发抢名额的竞态。
-		if !h.cfg.Pool.Acquire(acct.UID) {
-			// 若被抢的正是粘性号，立即解绑并回落普通轮换，避免下一轮仍撞同一个
-			// 满载粘性号再浪费一次 PickByUID 往返（语义与 fail()/PickByUID-nil 的解绑一致）。
-			if stickyUID != "" && acct.UID == stickyUID {
-				unbindSticky()
-			}
-			if !rotateBackoff(i, r.Context()) {
-				// 客户端已断连：换号重试无意义，终止轮转走末端错误透传。
-				break
-			}
-			continue // 最后一个名额被并发抢走 → 换号
-		}
 		heldUID = acct.UID
 
 		// token 临近过期 → 先 refresh（失败冷却换号）
@@ -1281,6 +1332,18 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// gateway_hint（末端透传）：上游错误按 Kind + 原文 + 请求形态判定；本地调度类
 	// 错误（无上游原文）固定 no_healthy_account hint。
 	hint := upstream.NoHealthyAccountHint()
+	// 在途饱和等待超时：不是「号全挂了」，是并发名额一直没释放。给 429 +
+	// Retry-After，让守规矩的客户端按退避重试——503 + no_healthy_account 会被
+	// 当成服务端过载立刻重打，正是重试风暴的形态。放在 upstream.Error 分支之前：
+	// 该路径上一次上游请求都没发（tried 为空即 break），lastErr 必为 nil。
+	if saturated && lastErr == nil {
+		status = http.StatusTooManyRequests
+		code = "pool_saturated"
+		msg = "pool saturated: every healthy account is at its in-flight limit, retry after the current requests finish"
+		hint = fmt.Sprintf("pool_saturated: %d healthy account(s) at in-flight limit (pool.max_in_flight); waited %s",
+			h.cfg.Pool.SaturatedCountFor(realm, bareModel), h.cfg.Pool.WaitTimeout())
+		w.Header().Set("Retry-After", "2")
+	}
 	// upstreamMsgPassed 记录 error.message 是否已被上游原文占据：模型级阻塞分支
 	// 据此决定要不要覆盖 msg（上游原文优先，含 requestId）。
 	upstreamMsgPassed := false
@@ -1347,6 +1410,46 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	writeOpenAIErrorHint(w, status, code, msg, hint)
 	st.status = status
 	st.outcome = reqlog.OutcomeHTTPError
+}
+
+// poolWaitPoll 在途名额轮询间隔：名额释放的粒度就是「一个请求结束」，
+// 更细的轮询只是白烧 CPU（15s 等待 ≈ 75 次空转）。
+const poolWaitPoll = 200 * time.Millisecond
+
+// acquireWithSlotWait 在在途饱和时反复尝试「选号 + 抢名额」，直到拿到一个**已占住
+// 名额**的号或窗口到期，返回的号名额已 Acquire 成功（调用方直接 heldUID = 它）。
+//
+// 为什么把 Acquire 放在这个循环里而不是外面：Pick 返回的号在 Pick 与 Acquire 之间
+// 可能被别的并发请求抢走（CAS 竞态），抢输就得立刻再试——那是毫秒级的事，不该
+// 消耗调用方 MaxRotate 的换号预算，也不该退避 0.5/1/2s。用换号预算去数名额争夺，
+// 会让 3 轮预算在十几秒的名额竞争里提前耗尽（生产实测残 4 条 503 的成因）。
+func (h *Handler) acquireWithSlotWait(ctx context.Context, realm, bareModel string, tried map[string]bool, deadline time.Time) *auth.Auth {
+	for {
+		if a := h.cfg.Pool.PickExcludingForRealm(tried, bareModel, realm); a != nil {
+			if h.cfg.Pool.Acquire(a.UID) {
+				return a
+			}
+			// 抢输：名额被并发拿走。立刻重试（不退避、不计换号）。
+			select {
+			case <-ctx.Done():
+				return nil
+			default:
+			}
+			continue
+		}
+		// 一个可选的号都没有：要么名额都满了（等），要么真的没号（立即放弃）。
+		if h.cfg.Pool.SaturatedCountFor(realm, bareModel) == 0 {
+			return nil
+		}
+		if !time.Now().Before(deadline) {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-time.After(poolWaitPoll):
+		}
+	}
 }
 
 // tokensPerSecond 计算吐字速率（token/s），返回 (速率, 是否有意义)。
