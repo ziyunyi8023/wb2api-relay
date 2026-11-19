@@ -32,6 +32,7 @@ type scanAccountItem struct {
 	Nickname  string          `json:"nickname"`
 	Growth    []upstream.Task `json:"growth,omitempty"`
 	GrowthErr string          `json:"growth_error,omitempty"`
+	SkipReason string          `json:"skip_reason,omitempty"`
 }
 
 // growthPending 任务是否"未完成且可自动化"。
@@ -75,11 +76,13 @@ func (p *Panel) tasksScanAll(w http.ResponseWriter, r *http.Request) {
 			it.UID, it.Nickname = uid, a.Nickname
 			// D4 门控：global 账号无 CN 成长任务体系，不发起任何上游调用。
 			if a.IsGlobal() {
+				it.SkipReason = "global 账号无 CN 成长任务体系（不发起上游调用）"
 				return
 			}
 			// 企业版门控：同上——企业版无个人成长体系（GET /v2/activity/growth/tasks
 			// 上游 403「growth system is only available for personal users」）。
 			if a.IsEnterprise() {
+				it.SkipReason = "企业版账号无个人成长体系（上游 403 growth system is only available for personal users）"
 				return
 			}
 			if tasks, err := p.cfg.Upstream.ListTasks(a); err != nil {
@@ -228,10 +231,6 @@ func (p *Panel) startGrowthQueue(concurrency int, growth bool) (started bool, to
 			// （含 expert_5 等真实对话配额），故不入队并给出重登指引（见
 			// auth.IsEnterpriseSession）。
 			if a.IsEnterprise() {
-				return
-			}
-			if a.IsEnterpriseSession() {
-				log.Printf("panel: WARN 队列跳过 uid=%s nickname=%q：凭证为企业切换会话（token_source=enterprise_switch），成长任务行为事件会被上游静默丢弃；请移除该账号，在浏览器退出企业切换（个人身份）后重新登录", a.UID, a.Nickname)
 				return
 			}
 			if growth {

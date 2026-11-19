@@ -787,6 +787,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		degradedApplied = true
 	}
 
+
 	// outbound model 名重写为 bareModel（D6）：realm 前缀是网关侧路由协议，
 	// 上游不认前缀（global 账号也请求裸模型名）。裸名时 bareModel==peek.Model 恒等。
 	if bareModel != peek.Model {
@@ -1033,6 +1034,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				degradedApplied = true
 				delete(tried, acct.UID) // 单账号池也能拿到重试机会（降级重试占一次名额）
 				releaseHeld()
+				// 诊断：把 system 开头（模板文本）记进日志，下次遇到新指纹能直接对照；
+				// user/assistant 正文不落日志（见 diagnose.go）。
+				log.Printf("content-blocked: body=%dB sys=%q", len(body), systemHead(body))
+				if hint := assistantFingerprintHint(body); hint != "" {
+					log.Printf("content-blocked: assistant 命中身份句形状: %q", hint)
+				}
 				log.Printf("content-blocked (likely fingerprint false positive) -> degraded prompt retry")
 				continue
 			}

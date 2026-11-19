@@ -1821,11 +1821,13 @@ func TestPreferExpiringDisabledRestoresWeight(t *testing.T) {
 	p.SetCreditsDetailed("b", 100, 100, 0, time.Time{}, 0)
 
 	p.mu.Lock()
+	// FEFO 后 a 的基础权重由到期紧迫度决定（不再等于 b 的积分权重），
+	// 所以这里验证的是「乘子本身」：routingWeightOf = weightOf × expiringVirtualSlots。
+	rawA := p.weightOf(p.byUID["a"], 100, now)
 	we := p.routingWeightOf(p.byUID["a"], 100, now)
-	wn := p.routingWeightOf(p.byUID["b"], 100, now)
 	p.mu.Unlock()
-	if we != wn*expiringVirtualSlots {
-		t.Fatalf("enabled expiring weight=%v want %v", we, wn*expiringVirtualSlots)
+	if we != rawA*expiringVirtualSlots {
+		t.Fatalf("enabled expiring weight=%v want %v (raw %v × %d)", we, rawA*expiringVirtualSlots, rawA, expiringVirtualSlots)
 	}
 
 	p.SetPreferExpiring(false)

@@ -142,7 +142,8 @@ func (p *Panel) importCockpit(w http.ResponseWriter, r *http.Request) {
 			} else if claimed {
 				log.Printf("panel: import global trial uid=%s 已领", uid)
 			}
-		} else {
+		} else if !a.IsEnterprise() {
+			// 企业版无签到体系（上游 400 code 10001），与 login.go / scheduler.go:487 同判据。
 			if err := p.cfg.Upstream.DailyCheckin(a); err != nil {
 				log.Printf("panel: import checkin uid=%s: %v", uid, err)
 			}

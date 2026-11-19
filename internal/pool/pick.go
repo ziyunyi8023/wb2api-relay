@@ -3,6 +3,7 @@ package pool
 
 import (
 	"log"
+	"math"
 	"math/rand/v2"
 	"sort"
 	"strconv"
@@ -447,11 +448,46 @@ func (p *Pool) pickWeighted(cands []*entry) *entry {
 	return cands[len(cands)-1]
 }
 
+// fefoHorizonDays 到期紧迫度的对数基准（天）。上游积分包有效期典型 7 天~1 年，
+// 取 365 让「一年后到期」紧迫度≈0、「一个月内」≈0.42、「一周内」≈0.6。
+const fefoHorizonDays = 365
+
+// fefoUrgency 把最早到期日折算成 [0,1] 的紧迫度：越临近到期越接近 1。
+//
+// 为什么用对数而不是线性：有效期跨度两个数量级，线性归一（无论是除以固定天数
+// 还是按池内 min/max 拉伸）都会把「9 天后」和「29 天后」算成几乎一样，头部压
+// 不出区分度；对数压缩能把一周内与一年后拉开 10 倍以上，且不依赖池内相对分布
+// ——账号增减不会让同一批次的紧迫度漂移。
+func fefoUrgency(expiry, now time.Time) float64 {
+	if expiry.IsZero() {
+		return 0
+	}
+	days := expiry.Sub(now).Hours() / 24
+	if days <= 0 {
+		return 1 // 今天到期或已过期：最高紧迫度
+	}
+	u := 1 - math.Log1p(days)/math.Log1p(fefoHorizonDays)
+	if u < 0 {
+		return 0
+	}
+	if u > 1 {
+		return 1
+	}
+	return u
+}
+
 // weightOf 计算单个账号的普通加权分值。
 func (p *Pool) weightOf(e *entry, maxCredits int64, now time.Time) float64 {
 	w := 1.0
-	// 1. credits 比例 ×10（会计入 mid-credit 锚点，避免全员 0 时 credits 项为 0）。
-	if maxCredits > 0 {
+	// 1. 余额项 ×10。prefer_expiring 开启且有可用余额时改用 FEFO：按最早到期日
+	//    的紧迫度给分，让「快过期的先花完」主导，而不是「谁积分多谁先花」。
+	//    旧口径（积分比例）恰好相反——积分越多权重越高，于是历史余额最高的号
+	//    被优先榨干，长期积分反而攒下来。
+	//    credits<=0 的号不参与 FEFO：否则「到期最近但余额见底」的号会拿到高权重，
+	//    选中即 402/402-hard，把一轮轮换白白烧掉。
+	if p.preferExpiring && e.credits > 0 && !e.creditsEarliestExpiry.IsZero() {
+		w += fefoUrgency(e.creditsEarliestExpiry, now) * 10
+	} else if maxCredits > 0 {
 		w += float64(e.credits) / float64(maxCredits) * 10
 	}
 	// 2. 闲置补偿。

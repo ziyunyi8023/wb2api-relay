@@ -263,6 +263,7 @@ function rateLimitMeta(row, now) {
       title: model + '\n模型当前不可用' + (deadline ? '\n最早重试：' + fmtLocalDateTime(deadline) : ''),
     };
   }
+  let detail;
   const title = [model, resetAt ? '上游重置：' + fmtLocalDateTime(resetAt) : '上游重置：时间未知'];
   if (until && resetAt && until < resetAt) {
     // 双时钟（issue #171 问题二）：黄框出现/消失由 until 决定（网关为防超长
@@ -2025,6 +2026,9 @@ $('btnRunQueue').onclick = async () => {
 function groupItems(d) {
   const groups = [];
   for (const a of (d.accounts || [])) {
+    // 账号被门控跳过（企业切换会话等）：单独成组显示原因，不能静默消失，
+    // 否则面板显示一堆待办、点执行却说没有（2026-11-19 实测的矛盾）。
+    if (a.skip_reason) { groups.push({ uid: a.uid, nick: a.nickname, skip: a.skip_reason, rows: [] }); continue; }
     const rows = [];
     for (const t of (a.growth || [])) {
       GROWTH_TITLES[t.task_code] = t.title || t.task_code;
@@ -2062,11 +2066,17 @@ function renderQueue(groups, progress, emptyTitle, emptyDesc) {
   empty.style.display = 'none';
   let total = 0;
   list.innerHTML = groups.map(g => {
+    if (g.skip) {
+      // 仍在拉列表：把任务原样列出（不计入可执行总数），原因写在组头下面。
+      return '<div class="qgroup"><header><span class="nm">' + esc(g.nick || g.uid.slice(0, 12)) + '</span><span class="cnt">已跳过 ' + g.rows.length + ' 项</span></header>' +
+        '<div class="qrow"><span class="msg">' + esc(g.skip) + '</span></div>' +
+        (g.rows.length ? g.rows.map(qrowHTML).join('') : '') + '</div>';
+    }
     total += g.rows.length;
     return '<div class="qgroup"><header><span class="nm">' + esc(g.nick || g.uid.slice(0, 12)) + '</span><span class="cnt">' + g.rows.length + ' 项待办</span></header>' +
       g.rows.map(qrowHTML).join('') + '</div>';
   }).join('');
-  $('qcSummary').textContent = total + ' 项';
+  $('qcSummary').textContent = total ? total + ' 项' : '0 项可执行';
   updateProgress(progress);
 }
 function updateProgress(q) {
@@ -2156,6 +2166,9 @@ function fmtCreditRatio(v, samples, tokens) {
   if (!samples || !tokens) return '—';
   const n = Number(v || 0);
   if (!Number.isFinite(n)) return '—';
+  // 单价 0 = 这段样本没有真正计费（免费模型 credit=0 是上游明确返回的）。
+  // 显示「免费」而不是 0.0000 / 1M——后者会被读成"便宜"，掩盖了它其实是另一类额度。
+  if (n <= 0) return '免费';
   return trimFixed(n.toFixed(4)) + ' / 1M';
 }
 function fmtModelRate(rate) {

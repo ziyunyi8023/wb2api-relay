@@ -19,6 +19,7 @@ var sanitizeFeatures = []string{
 	"Main branch (",              // 注入指令句（截断前缀即可命中）
 	"You are a coding agent running in the Codex CLI", // Codex instructions 首段（截断前缀即可命中）
 	"github.com/anthropics/",                          // 反馈句里的 Anthropic 仓库链接
+	"You are an AI agent powered by", // agent 身份句形状（上游按「形状+产品名」拦截）
 	"11128",                                           // 上游反探测：裸数字错误码
 }
 
@@ -78,6 +79,22 @@ var sanitizeRewrites = [][2]string{
 	},
 }
 
+// sanitizeAgentShapeRe 通用 agent 身份句形状。
+//
+// 上游按「形状 + 产品名」精确匹配拦截（实测表见
+// magpie-community/plugins packages/workbuddy/REFUSED.md）：
+//   "You are an AI agent, powered by DeepSeek Harness."         → 400 code 11-128
+//   "You are an AI agent, powered by DeepSeek Harness Desktop." → 400（加词无用）
+//   "You are an AI agent, powered by DeepSeek Harness."         → 200（插逗号通过）
+//   "You are an AI agent powered by Claude Code."               → 200（换名通过）
+//
+// 破坏形状即通杀所有产品名（含我们还没见过的），比逐个产品名列举更稳。
+// 已是逗号形态的文本不再匹配，因此幂等；语义不变，只多一个逗号。
+var sanitizeAgentShapeRe = regexp.MustCompile("You are an AI agent powered by ")
+
+// sanitizeAgentShapeReplacement 插逗号后的形状（与匹配串一一对应）。
+const sanitizeAgentShapeReplacement = "You are an AI agent, powered by "
+
 // sanitizeText 单段文本净化：预检不中 → 返回原串（零分配）。
 func sanitizeText(text string) string {
 	if !hasFingerprint(text) {
@@ -86,6 +103,8 @@ func sanitizeText(text string) string {
 	for _, rw := range sanitizeRewrites {
 		text = strings.ReplaceAll(text, rw[0], rw[1])
 	}
+	// 通用形状改写：插逗号破坏「形状 + 产品名」匹配（见 sanitizeAgentShapeRe）。
+	text = sanitizeAgentShapeRe.ReplaceAllString(text, sanitizeAgentShapeReplacement)
 	if sanitizeHdrRe.MatchString(text) {
 		text = sanitizeHdrRe.ReplaceAllString(text, "")
 	}

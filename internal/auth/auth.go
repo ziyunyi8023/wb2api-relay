@@ -231,7 +231,21 @@ func (a *Auth) IsEnterpriseSession() bool {
 	if a.IsEnterprise() {
 		return true
 	}
-	return jwtTokenSource(a.AccessTokenValue()) == "enterprise_switch"
+	// token_source=enterprise_switch **不再单独作为判据**（2026-11-19 实测推翻）。
+	//
+	// 原判据来自 2026-10-12 的一次 A/B 对照（commit 9282779），当时假定该声明
+	// 等价于「浏览器停在该账号的企业空间里完成授权」。实测 13 个账号的 access +
+	// refresh token 全部带此声明，而它们的授权时刻分散在 6 个不同时间点
+	// （11-16 22:00 / 11-18 14:16 / 15:38 / 15:41 / 15:43 / 22:00），
+	// EnterpriseID 全为空（真企业版才非空）。13 次独立授权不可能次次都撞上
+	// 「企业切换状态」——该声明是 platform=CLI 授权通道的**常态输出**，
+	// 与账号身份无关。继续用它做门控会把全部 CLI 授权账号误判为「零收益」，
+	// 表现为成长任务/签到/旅行/夜猫子/活跃上报全部静默跳过。
+	//
+	// 保留本方法只为「真企业版」语义（enterpriseId 非空，上游确实无个人成长体系）。
+	// 若某账号真的行为事件不计分，应由执行后的进度回读发现，而不是凭 JWT 声明
+	// 预先定罪——判据要能被观测推翻。
+	return false
 }
 
 // jwtTokenSource 解出 JWT payload 中的 token_source 声明；非 JWT / 解码失败

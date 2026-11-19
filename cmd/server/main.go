@@ -10,6 +10,7 @@ import (
 	"io"
 	"io/fs"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -403,20 +404,58 @@ func main() {
 		// （长流式生成合法时长可达数分钟，全局 WriteTimeout 会误杀在途 SSE）。
 		IdleTimeout: 120 * time.Second,
 	}
+	// 先显式 listen：端口占用要在打印 "listening" 之前就失败，且 serveWithDrain
+	// 需要 listener 句柄来保证排空期间进程不退出。
+	ln, err := net.Listen("tcp", cfg.Listen)
+	if err != nil {
+		log.Fatalf("listen %s: %v", cfg.Listen, err)
+	}
+
+	log.Printf("workbuddy2api listening on %s (api_key=%v)，管理面板 http://127.0.0.1%s/panel/", cfg.Listen, cfg.APIKey != "", panelListenPath(cfg.Listen))
+	if err := serveWithDrain(srv, ln, ctx, p.Flush, drainWindow); err != nil {
+		log.Fatalf("http: %v", err)
+	}
+	log.Printf("bye")
+}
+
+// drainWindow 优雅停机窗口：覆盖 hy4 长思考/长流式在飞请求，超时才强制收尾。
+const drainWindow = 20 * time.Second
+
+// serveWithDrain 在 listener 上提供服务，并保证「排空完成之前进程不退出」。
+//
+// 为什么必须等（2026-11-19 实读代码确认）：srv.Shutdown 一开始执行，
+// srv.Serve/ListenAndServe 就立刻返回 http.ErrServerClosed，而 Shutdown 自身还要
+// 等在途请求结束（最长一个 drainWindow）。原实现把 Shutdown 丢进后台 goroutine
+// 就继续走到 main 结尾——进程随即退出，20 秒窗口形同虚设，在飞的 SSE 流被操作系统
+// 直接切断，客户端看到的就是 Connection error / 流被打断。换版与看门狗重启走的
+// 都是 ctx 取消这条路径，所以这里必须等到 Shutdown 真正返回。
+//
+// flush 在 Shutdown 之前调用（信号触发时先落盘）；可为 nil。
+// 返回错误仅表示监听失败或排空超窗，正常关闭返回 nil。
+func serveWithDrain(srv *http.Server, ln net.Listener, ctx context.Context, flush func(), window time.Duration) error {
+	drained := make(chan struct{})
 	go func() {
+		defer close(drained)
 		<-ctx.Done()
-		p.Flush() // 信号触发：先落盘再做优雅停机
-		// drain 窗口 20s：覆盖 hy4 长思考/长流式在飞请求；超时才强制收尾。
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		if flush != nil {
+			flush()
+		}
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), window)
 		defer cancel()
 		_ = srv.Shutdown(shutdownCtx)
 	}()
 
-	log.Printf("workbuddy2api listening on %s (api_key=%v)，管理面板 http://127.0.0.1%s/panel/", cfg.Listen, cfg.APIKey != "", panelListenPath(cfg.Listen))
-	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		log.Fatalf("http: %v", err)
+	serveErr := srv.Serve(ln)
+	if serveErr != nil && serveErr != http.ErrServerClosed {
+		return serveErr
 	}
-	log.Printf("bye")
+	// Serve 已返回 = 已发起关闭：等在途请求排空，或等窗口耗尽后放弃。
+	select {
+	case <-drained:
+		return nil
+	case <-time.After(window + 5*time.Second):
+		return fmt.Errorf("drain 超过 %s 仍未完成", window)
+	}
 }
 
 // warmModelRates 启动预热各域模型积分倍率表（供积分保底的目录兜底判定）。

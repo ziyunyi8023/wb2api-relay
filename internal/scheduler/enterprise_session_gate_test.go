@@ -10,9 +10,12 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
 
-// sessionTestScheduler 与 enterpriseTestScheduler 同构：switched=true 时账号的
-// AccessToken 为带 token_source=enterprise_switch 的 JWT（企业**切换会话**，
-// enterpriseId 为空——网关无法凭 enterpriseId 识别的形态）；false 为个人号对照组。
+// sessionTestScheduler 与 enterpriseTestScheduler 同构：switched=true 时账号为
+// **真企业版**（EnterpriseID 非空，上游确实无个人成长体系）；false 为个人号对照组。
+//
+// 2026-11-19 判据修正：原来用 token_source=enterprise_switch 表示"企业切换会话"，
+// 实测 13 个 CLI 授权账号全部带此声明（授权时刻分散在 6 个不同时点），该声明是
+// platform=CLI 通道的常态输出，不能作为判据。门控语义本身未变，只换触发条件。
 func sessionTestScheduler(t *testing.T, switched bool) (*Scheduler, *recorderUpstream) {
 	t.Helper()
 	r := &recorderUpstream{}
@@ -25,6 +28,9 @@ func sessionTestScheduler(t *testing.T, switched bool) (*Scheduler, *recorderUps
 		token = "hdr." + payload + ".sig"
 	}
 	a := &auth.Auth{UID: "u1", AccessToken: token, RefreshToken: "rt", ExpiresAt: 9999999999}
+	if switched {
+		a.EnterpriseID = "e1" // 真企业版：判据看这个，不看 token_source
+	}
 	p := pool.New("")
 	p.Add(a)
 
@@ -58,7 +64,9 @@ func TestEnterpriseSessionGateSkipsBehaviorTasks(t *testing.T) {
 		// gated=true 期望切换会话不发该请求；false 期望照常发（不门控）。
 		gated bool
 	}{
-		{"签到", func(s *Scheduler) { s.RunCheckinNow() }, "/daily-checkin", false},
+		// 签到：真企业版跳过（上游 400 code 10001「企业账号不支持该操作」，
+		// 见 scheduler.go:487 的 !IsEnterprise() 判断）。个人号不受影响。
+		{"签到", func(s *Scheduler) { s.RunCheckinNow() }, "/daily-checkin", true},
 		{"活跃上报", func(s *Scheduler) { s.RunActivityNow() }, "/v2/report", true},
 		{"猫猫旅行", func(s *Scheduler) { s.RunTravelNow() }, "/activity/growth/buddy/info", true},
 		{"夜猫子", func(s *Scheduler) { s.RunBlackcatNow() }, "/v2/activity/growth/tasks", true},

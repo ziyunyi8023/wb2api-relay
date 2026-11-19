@@ -624,7 +624,11 @@ func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 	// 企业版无签到体系（上游 400 code 10001「企业账号不支持该操作」）：不发起该调用，
 	// 端点退化为「刷新额度」——企业额度走 get-enterprise-user-usage 口径（见 upstream）。
 	// 前端对企业号不渲染「签到」按钮；此处是 API 侧防御（外部脚本/旧缓存前端仍可能调用）。
-	if a.IsEnterprise() {
+	// global 账号同样不发起签到：scheduler.go:480 对 global 是直接 continue（避免风控），
+	// 面板手动签到曾经绕过它真发了 DailyCheckin——同一判据两个入口，必有一个是错的。
+	if a.IsGlobal() {
+		checkinMsg = "国际版账号无 CN 签到体系（已跳过签到，仅刷新额度）"
+	} else if a.IsEnterprise() {
 		checkinMsg = "企业账号无签到体系（已跳过签到，仅刷新额度）"
 	} else if err := p.cfg.Upstream.DailyCheckin(a); err != nil {
 		checkinMsg = err.Error() // "今天已签到"等业务错误照常查余额
