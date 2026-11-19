@@ -69,6 +69,12 @@ func TestClassify(t *testing.T) {
 		{400, `{"error":{"code": "11135", "message":"image invalid"}}`, ErrImageInvalid},
 		// 防过宽：11133（模型不支持图片）不进 image_invalid。
 		{400, `{"code": 11133, "msg":"model does not support image"}`, ErrClient},
+		// 11129 invalid function call parameters：schema/请求级确定性拒绝（pattern `\_` 等）。
+		// 同 body 换号必然同样 400，必须 fail-fast，否则轮号后伪装成 503 no_healthy_account。
+		{400, `{"code":11129,"msg":"invalid function call parameters"}`, ErrBadParams},
+		{400, `{"code": 11129, "msg":"invalid function call parameters"}`, ErrBadParams},
+		{400, `{"code":"11129","msg":"invalid function call parameters"}`, ErrBadParams},
+		{400, `{"code":11129,"msg":"invalid function call parameters","requestId":"749154e86cd772b247c6c8c9bd32dafd","retry_policy":{"retry":false},"extError":{"code":"invalid_function_parameters","message":"invalid function call parameters","param":"","type":"invalid_request_error","StatusCode":400},"displayMsg":{"zh":"工具定义不合规，请新建任务重试"}}`, ErrBadParams},
 		// 11151 空 content 消息：确定性请求级错误，fail-fast 不轮转（防伪装 no_healthy_account）。
 		{400, `{"code":11151,"msg":"a message has empty content, please check the conversation history and retry","requestId":"cc695d3fb39e8a871d03b3aa3a450df9","extError":{"code":"400001","message":"a message has empty content, please check the conversation history and retry","param":"","type":"invalid_request_error","StatusCode":400}}`, ErrEmptyContent},
 		{400, `{"code": 11151, "msg":"a message has empty content"}`, ErrEmptyContent},

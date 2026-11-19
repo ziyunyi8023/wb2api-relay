@@ -703,6 +703,15 @@ func Classify(status int, body string) ErrKind {
 				return ErrContentBlocked
 			}
 		}
+		// 11129「invalid function call parameters」：请求级/schema 级确定性拒绝。
+		// 上游对 tools[].function.parameters 的严格正则文法校验（如 pattern 含 `\_`）
+		// 会在解析阶段就拒收，同一 body 换任何账号都是 400。网关侧 normalizeToolPatterns
+		// 已在发送前归一 `\_`；若仍漏到上游（如 tool_call arguments 里的非法转义），
+		// 继续轮号只会把真实原因伪装成 503 no_healthy_account 并烧满连败计数。
+		// 归 ErrBadParams：fail-fast、原文透传、不罚号、不轮转。
+		if status == http.StatusBadRequest && codeMarker(lower, "11129") {
+			return ErrBadParams
+		}
 		// 请求体解析失败（HTTP 400 + Unmarshal chat params failed / code 11101）：
 		// 这是"发给上游的 body 有问题"。网关侧截断已由 413 消灭（issue #41 commit A），
 		// 剩余来源是客户端 JSON 本身畸形——换了账号照样 400，不该罚号（白白冷却好号）。
