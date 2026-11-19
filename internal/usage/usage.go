@@ -204,10 +204,19 @@ func (r *Recorder) Add(now time.Time, realm, uid, model string, d Delta, ok bool
 		b.CRN++
 		// 比例只使用同一次请求同时具备 credit 与 token 的样本，避免把
 		// 仅 token 的旧记录或仅 credit 的观测混进分母。
-		if d.HasTotal {
-			b.CRT += d.TotalTokens
-		} else if d.HasPromptTokens || d.HasCompletion {
-			b.CRT += d.PromptTokens + d.CompletionTokens
+		//
+		// ★ 分母只统计**真正计费**（credit > 0）的请求（2026-11-19 修）：
+		// 免费模型（cn:hy4flash-free 等）每次明确返回 credit=0，它的 token 若进
+		// 分母，就把「积分 / 1M Token」摊薄成看似很便宜的数——实测 11-18 有
+		// 941M 免费 token 进分母，全站平均单价被算成 1.06，而同期
+		// deepseek-v4.1-flash 自己是 6.13。免费额度要单独看，不能混算。
+		// CRN 保持原语义（样本数，含真实 0），只有 CRT（分母）收紧。
+		if d.Credit > 0 {
+			if d.HasTotal {
+				b.CRT += d.TotalTokens
+			} else if d.HasPromptTokens || d.HasCompletion {
+				b.CRT += d.PromptTokens + d.CompletionTokens
+			}
 		}
 	}
 	if d.HasCacheTokens {
@@ -382,7 +391,13 @@ func (g *aggAcc) add(b *bucket) {
 	g.TotalTokens += b.TT
 	g.Credits += b.CR
 	g.CreditSamples += b.CRN
-	g.CreditTokens += b.CRT
+	// 免费桶不进分母：b.CR==0 说明这桶一个积分都没扣（免费模型 / 免费额度），
+	// 它的 token 若进分母会把「积分/1M Token」摊薄——实测 11-18 有 1004M 免费
+	// token 混入，全站单价被算成 1.06，而同期 deepseek-v4.1-flash 自己是 6.13。
+	// 写入端已改为只累加 credit>0，但**历史桶存的是旧口径**，只能在聚合处兜住。
+	if b.CR > 0 {
+		g.CreditTokens += b.CRT
+	}
 	g.CacheHitTokens += b.CH
 	g.CacheMissTokens += b.CM
 	g.latSum += b.LatMs
@@ -448,7 +463,13 @@ func (a *creditAcc) add(b *bucket) {
 	a.Requests += b.Req
 	a.Credits += b.CR
 	a.CreditSamples += b.CRN
-	a.CreditTokens += b.CRT
+	// 免费桶不进分母：b.CR==0 说明这桶一个积分都没扣（免费模型 / 免费额度），
+	// 它的 token 若进分母会把「积分/1M Token」摊薄——实测 11-18 有 1004M 免费
+	// token 混入，全站单价被算成 1.06，而同期 deepseek-v4.1-flash 自己是 6.13。
+	// 写入端已改为只累加 credit>0，但**历史桶存的是旧口径**，只能在聚合处兜住。
+	if b.CR > 0 {
+		a.CreditTokens += b.CRT
+	}
 	a.CacheHitTokens += b.CH
 	a.CacheMissTokens += b.CM
 }

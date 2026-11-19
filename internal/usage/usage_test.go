@@ -353,3 +353,30 @@ func TestCacheTokensPersistRoundtrip(t *testing.T) {
 		t.Fatalf("恢复后 cache_hit_rate=%v want 75", snap.CreditByModel[0].CacheHitRate)
 	}
 }
+
+// 免费模型（credit=0）的 token 不得进 CreditTokens 分母，否则单价被摊薄。
+// 实测 2026-11-18：941M 免费 token 混入后全站单价算成 1.06，而计费模型自己是 6.13。
+func TestFreeTokensDoNotDiluteCreditRatio(t *testing.T) {
+	r := New("")
+	now := time.Now()
+	// 计费样本：1 积分 / 100 token → 10000 每 1M。
+	r.Add(now, "cn", "u1", "cn:deepseek-v4.1-flash", Delta{TotalTokens: 100, HasTotal: true, Credit: 1, HasCredit: true}, true)
+	// 免费样本：credit 明确为 0，token 巨大（模拟 cn:hy4flash-free 的 941M）。
+	r.Add(now, "cn", "u1", "cn:hy4flash-free", Delta{TotalTokens: 941_000_000, HasTotal: true, Credit: 0, HasCredit: true}, true)
+
+	s := r.Snapshot(0, nil)
+	// CRN 保持原语义（样本数，含 credit=0 的真实请求），只有分母 CRT 收紧。
+	if s.Totals.CreditSamples != 2 {
+		t.Fatalf("credit samples = %d, want 2（CRN 含免费请求，语义不变）", s.Totals.CreditSamples)
+	}
+	if s.Totals.CreditTokens != 100 {
+		t.Fatalf("credit tokens = %d, want 100（免费 941M 不得进分母）", s.Totals.CreditTokens)
+	}
+	if s.Totals.CreditsPer1MTokens != 10000 {
+		t.Fatalf("ratio = %v, want 10000（免费 token 摊薄会掉到 ~1）", s.Totals.CreditsPer1MTokens)
+	}
+	// 免费请求总量仍计入普通 totals，只是不参与单价。
+	if s.Totals.TotalTokens != 941_000_100 || s.Totals.Requests != 2 {
+		t.Fatalf("totals = tokens %d / req %d, want 941000100 / 2", s.Totals.TotalTokens, s.Totals.Requests)
+	}
+}
